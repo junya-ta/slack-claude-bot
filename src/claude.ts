@@ -28,7 +28,8 @@ export interface ProgressCallback {
 export async function runClaude(
   task: string,
   repoPath: string,
-  onProgress?: ProgressCallback
+  onProgress?: ProgressCallback,
+  resumeSessionId?: string
 ): Promise<ClaudeResult> {
   return new Promise((resolve) => {
     const args = [
@@ -39,8 +40,14 @@ export async function runClaude(
       '--max-turns', String(config.maxTurns),
     ];
 
+    // セッション継続の場合
+    if (resumeSessionId) {
+      args.push('--resume', resumeSessionId);
+    }
+
     console.log(`[Claude] Running in ${repoPath}`);
     console.log(`[Claude] Task: ${task}`);
+    console.log(`[Claude] Resume: ${resumeSessionId || 'new session'}`);
     console.log(`[Claude] Args: ${args.join(' ')}`);
 
     const proc = spawn('claude', args, {
