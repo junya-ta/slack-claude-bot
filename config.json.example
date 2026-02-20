@@ -1,0 +1,9 @@
+{
+  "allowedChannels": [],
+  "repos": {
+    "example": "/Users/your-name/works/example-repo"
+  },
+  "maxTurns": 10,
+  "timeoutMs": 600000,
+  "allowedTools": ["Read", "Bash", "Edit", "Write", "Glob", "Grep"]
+}
