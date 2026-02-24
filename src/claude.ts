@@ -25,11 +25,16 @@ export interface ProgressCallback {
   (status: string): void;
 }
 
+export interface AssistantMessageCallback {
+  (text: string): void;
+}
+
 export async function runClaude(
   task: string,
   repoPath: string,
   onProgress?: ProgressCallback,
-  resumeSessionId?: string
+  resumeSessionId?: string,
+  onAssistantMessage?: AssistantMessageCallback
 ): Promise<ClaudeResult> {
   return new Promise((resolve) => {
     const args = [
@@ -78,9 +83,9 @@ export async function runClaude(
         try {
           const event: StreamEvent = JSON.parse(line);
 
-          // セッションID取得
-          if (event.session_id) {
+          if (event.session_id && !sessionId) {
             sessionId = event.session_id;
+            console.log(`[Claude] session_id captured: ${sessionId}`);
           }
 
           // ツール使用を検知
@@ -117,6 +122,7 @@ export async function runClaude(
               .join('\n');
             if (textContent) {
               lastResult = textContent;
+              onAssistantMessage?.(textContent);
             }
           }
 
@@ -163,6 +169,8 @@ export async function runClaude(
           // 無視
         }
       }
+
+      console.log(`[Claude] Process exited with code ${code}, sessionId="${sessionId}"`);
 
       if (code !== 0 && !lastResult) {
         resolve({

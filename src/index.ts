@@ -1,7 +1,13 @@
 import 'dotenv/config';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from 'fs';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
 import { App, LogLevel } from '@slack/bolt';
 import { config, getRepoPath, isChannelAllowed } from './config.js';
-import { runClaude } from './claude.js';
+import { runClaude, type AssistantMessageCallback } from './claude.js';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const THREAD_CONTEXT_DIR = join(__dirname, '..', 'tmp', 'threads');
 
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
@@ -10,13 +16,49 @@ const app = new App({
   logLevel: LogLevel.INFO,
 });
 
-// スレッドごとのコンテキストを保存
 interface ThreadContext {
   repoName: string;
   repoPath: string;
   sessionId: string;
 }
-const threadContexts = new Map<string, ThreadContext>();
+
+function threadContextPath(threadKey: string): string {
+  return join(THREAD_CONTEXT_DIR, `${threadKey}.json`);
+}
+
+function loadThreadContext(threadKey: string): ThreadContext | undefined {
+  const filePath = threadContextPath(threadKey);
+  try {
+    if (!existsSync(filePath)) return undefined;
+    return JSON.parse(readFileSync(filePath, 'utf-8')) as ThreadContext;
+  } catch (err) {
+    console.error(`[ThreadContext] Failed to load ${threadKey}:`, err);
+    return undefined;
+  }
+}
+
+function saveThreadContext(threadKey: string, ctx: ThreadContext): void {
+  try {
+    mkdirSync(THREAD_CONTEXT_DIR, { recursive: true });
+    writeFileSync(threadContextPath(threadKey), JSON.stringify(ctx, null, 2));
+    console.log(`[ThreadContext] Saved ${threadKey}:`, ctx);
+  } catch (err) {
+    console.error(`[ThreadContext] Failed to save ${threadKey}:`, err);
+  }
+}
+
+function deleteThreadContext(threadKey: string): boolean {
+  const filePath = threadContextPath(threadKey);
+  try {
+    if (!existsSync(filePath)) return false;
+    unlinkSync(filePath);
+    console.log(`[ThreadContext] Deleted ${threadKey}`);
+    return true;
+  } catch (err) {
+    console.error(`[ThreadContext] Failed to delete ${threadKey}:`, err);
+    return false;
+  }
+}
 
 // repo:name 形式でリポジトリ名を抽出
 function parseMessage(text: string): { repoName: string | null; task: string } {
@@ -57,10 +99,11 @@ app.message(async ({ message, say, client }) => {
   if (!('text' in message) || !message.text) return;
   if (!('channel' in message)) return;
 
+  console.log('STDOUT:', message);
+
   const channelId = message.channel;
   // スレッド内のメッセージの場合は thread_ts、そうでなければ ts をスレッドキーに
   const threadKey = ('thread_ts' in message && message.thread_ts) ? message.thread_ts : message.ts;
-  const replyTs = message.ts;
 
   // チャンネル制限チェック
   if (!isChannelAllowed(channelId)) {
@@ -104,8 +147,7 @@ app.message(async ({ message, say, client }) => {
 
   // reset コマンド: スレッドのセッションをリセット
   if (text === 'reset') {
-    if (threadContexts.has(threadKey)) {
-      threadContexts.delete(threadKey);
+    if (deleteThreadContext(threadKey)) {
       await say({
         text: 'セッションをリセットしました。`repo:リポジトリ名` で新しいセッションを開始してください。',
         thread_ts: threadKey,
@@ -120,7 +162,8 @@ app.message(async ({ message, say, client }) => {
   }
 
   // 既存のスレッドコンテキストを確認
-  const existingContext = threadContexts.get(threadKey);
+  const existingContext = loadThreadContext(threadKey);
+  console.log(`[ThreadContext] threadKey=${threadKey}, existingContext=`, existingContext);
 
   const { repoName, task } = parseMessage(text);
 
@@ -146,7 +189,7 @@ app.message(async ({ message, say, client }) => {
     // スレッド内で既存コンテキストを継続
     currentRepoName = existingContext.repoName;
     currentRepoPath = existingContext.repoPath;
-    resumeSessionId = existingContext.sessionId;
+    resumeSessionId = existingContext.sessionId || undefined;
   } else {
     // コンテキストがなく、リポジトリ指定もない
     await say({
@@ -186,8 +229,31 @@ app.message(async ({ message, say, client }) => {
     }
   };
 
+  let assistantMsgTs: string | undefined;
+
+  const onAssistantMessage: AssistantMessageCallback = (text) => {
+    const preview = text.slice(0, 3000);
+    const content = `:speech_balloon: ${preview}${text.length > 3000 ? '\n_...（続き）_' : ''}`;
+
+    if (assistantMsgTs) {
+      client.chat.update({
+        channel: channelId,
+        ts: assistantMsgTs,
+        text: content,
+      }).catch(() => {});
+    } else {
+      client.chat.postMessage({
+        channel: channelId,
+        thread_ts: threadKey,
+        text: content,
+      }).then((res) => {
+        assistantMsgTs = res.ts;
+      }).catch(() => {});
+    }
+  };
+
   try {
-    const result = await runClaude(taskText, currentRepoPath, updateProgress, resumeSessionId);
+    const result = await runClaude(taskText, currentRepoPath, updateProgress, resumeSessionId, onAssistantMessage);
 
     // 処理中メッセージを削除
     if (processingMsg.ts) {
@@ -197,6 +263,7 @@ app.message(async ({ message, say, client }) => {
       }).catch(() => {});
     }
 
+
     if (!result.success) {
       await say({
         text: `:x: エラー\n\`\`\`\n${result.error}\n\`\`\``,
@@ -205,14 +272,14 @@ app.message(async ({ message, say, client }) => {
       return;
     }
 
-    // セッションIDを保存
-    if (result.sessionId) {
-      threadContexts.set(threadKey, {
-        repoName: currentRepoName,
-        repoPath: currentRepoPath,
-        sessionId: result.sessionId,
-      });
-    }
+    // セッションIDを保存（sessionIdが取れなくてもrepo情報は保存）
+    const sessionId = result.sessionId || '';
+    console.log(`[ThreadContext] sessionId from Claude: "${sessionId}"`);
+    saveThreadContext(threadKey, {
+      repoName: currentRepoName,
+      repoPath: currentRepoPath,
+      sessionId,
+    });
 
     const responseText = result.result || '(応答なし)';
     const chunks = splitMessage(responseText);
@@ -224,10 +291,9 @@ app.message(async ({ message, say, client }) => {
       });
     }
 
-    // セッション情報を表示（新規の場合のみ）
-    if (result.sessionId && !resumeSessionId) {
+    if (!resumeSessionId) {
       await say({
-        text: `_スレッド内で継続可能 | repo: ${currentRepoName}_`,
+        text: `_スレッド内で継続可能 | repo: ${currentRepoName}${sessionId ? ` | session: ${sessionId.slice(0, 12)}...` : ''}_`,
         thread_ts: threadKey,
       });
     }
