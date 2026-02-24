@@ -2,6 +2,18 @@
 
 SlackからClaude Codeを呼び出してローカルリポジトリを操作するボット。
 
+## 前提条件
+
+| 必要なもの | バージョン / 詳細 |
+|---|---|
+| **Node.js** | v18 以上（ES2022 / ESM を使用） |
+| **npm** | Node.js に同梱のもので可 |
+| **Claude Code CLI** | `claude` コマンドがPATH上で実行できること（[インストール手順](https://docs.anthropic.com/en/docs/claude-code/overview)） |
+| **Anthropic APIキー** | Claude Code CLI の認証が完了していること（`claude` を一度実行してログイン） |
+| **Slackワークスペース** | Slack App を作成・インストールできる管理者権限 |
+
+> **注意**: このボットは `claude` コマンドを子プロセスとして起動し、`--dangerously-skip-permissions` フラグ付きで実行します。信頼できるネットワーク・チャンネルでのみ使用してください。
+
 ## セットアップ手順
 
 ### 1. Slack App作成
