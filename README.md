@@ -1,6 +1,32 @@
 # Slack Claude Bot
 
-SlackからClaude Codeを呼び出してローカルリポジトリを操作するボット。
+SlackからClaude Code CLIを呼び出し、ローカルリポジトリに対してコード読解・編集・バグ修正などを実行できるボット。
+
+ローカルPCでNodeサーバを起動し、Slackの専用チャンネル経由でAIによるコード操作を手軽に呼び出せる個人向けツールです。
+
+## 特徴
+
+- **メンション駆動** — `@bot` 付きメッセージにのみ反応。通常の会話を邪魔しない
+- **マルチリポジトリ対応** — `config.json` に複数のリポジトリを登録し、メッセージで切り替え可能
+- **スレッドでセッション継続** — 同一スレッド内のやり取りは同じClaude Codeセッションとして継続。文脈を保ったまま追加指示が可能
+- **リアルタイム進捗表示** — Claude Codeのツール実行状況（ファイル読み込み、Grep、編集など）をSlack上にリアルタイムで表示
+- **チャンネル制限** — 許可されたチャンネルでのみ動作するよう制御可能
+
+## アーキテクチャ
+
+```
+Slack ──(Socket Mode)──▶ Node.js (Bolt) ──(子プロセス)──▶ Claude Code CLI
+                              │                                  │
+                              │  進捗・結果をSlackへ投稿          │  ローカルリポジトリを操作
+                              ◀──────────────────────────────────┘
+```
+
+| コンポーネント | 技術 |
+|---|---|
+| Slack連携 | [Slack Bolt for JavaScript](https://slack.dev/bolt-js/) / Socket Mode |
+| AI実行 | [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code/overview) (`--output-format stream-json`) |
+| ランタイム | Node.js (ESM / TypeScript) |
+| セッション管理 | ファイルベース (`tmp/threads/`) |
 
 ## 前提条件
 
@@ -35,7 +61,7 @@ SlackからClaude Codeを呼び出してローカルリポジトリを操作す�
 
 1. 左メニュー「OAuth & Permissions」をクリック
 2. 「Bot Token Scopes」セクションで以下を追加:
-   - `channels:history` - チャンネルメッセージ読み取り
+   - `app_mentions:read` - メンションの読み取り
    - `chat:write` - メッセージ送信
 
 ### 4. Event Subscriptions設定
@@ -43,7 +69,7 @@ SlackからClaude Codeを呼び出してローカルリポジトリを操作す�
 1. 左メニュー「Event Subscriptions」をクリック
 2. 「Enable Events」をONに
 3. 「Subscribe to bot events」で以下を追加:
-   - `message.channels`
+   - `app_mention`
 4. 「Save Changes」をクリック
 
 ### 5. Appインストール
@@ -110,21 +136,41 @@ npm run start
 
 ## 使い方
 
-Slackチャンネルで以下の形式でメッセージを送信:
+Slackチャンネルで **ボットをメンション** してメッセージを送信:
 
 ```
-repo:リポジトリ名 やりたいこと
+@Claude Code Bot repo:リポジトリ名 やりたいこと
 ```
+
+> ボットはメンション付きメッセージにのみ反応します。チャンネル内の通常メッセージには反応しません。
 
 ### 例
 
 ```
-repo:my-project このバグを修正して: TypeError in auth.ts
+@Claude Code Bot repo:my-project このバグを修正して: TypeError in auth.ts
 
-repo:my-project src/utils.ts のコードを説明して
+@Claude Code Bot repo:my-project src/utils.ts のコードを説明して
 
-repo:my-project ユーザー認証のテストを追加して
+@Claude Code Bot repo:my-project ユーザー認証のテストを追加して
 ```
+
+### スレッド内での継続
+
+スレッド内でもメンション付きでメッセージを送ると、同じセッションで会話を継続できます:
+
+```
+@Claude Code Bot 他にも似たバグがないか探して
+```
+
+### コマンド一覧
+
+| コマンド | 説明 |
+|---|---|
+| `@bot repo:リポジトリ名 タスク` | 新規セッション開始 |
+| `@bot メッセージ`（スレッド内） | 同じセッションで継続 |
+| `@bot repos` / `@bot list` | 設定済みリポジトリ一覧を表示 |
+| `@bot reset` | スレッドのセッションをリセット |
+| `@bot help` | ヘルプを表示 |
 
 ## トラブルシューティング
 
@@ -134,10 +180,12 @@ repo:my-project ユーザー認証のテストを追加して
 
 ### Botが反応しない
 
-1. Botがチャンネルに招待されているか確認
-2. `npm run dev` でサーバーが起動しているか確認
-3. `.env` のトークンが正しいか確認
-4. Socket Modeが有効になっているか確認
+1. メッセージに `@ボット名` のメンションが含まれているか確認
+2. Botがチャンネルに招待されているか確認
+3. `npm run dev` でサーバーが起動しているか確認
+4. `.env` のトークンが正しいか確認
+5. Socket Modeが有効になっているか確認
+6. Event Subscriptionsで `app_mention` が登録されているか確認
 
 ### タイムアウトする
 

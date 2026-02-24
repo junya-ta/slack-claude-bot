@@ -9,12 +9,21 @@ import { runClaude, type AssistantMessageCallback } from './claude.js';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const THREAD_CONTEXT_DIR = join(__dirname, '..', 'tmp', 'threads');
 
+let botUserId = '';
+
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
   socketMode: true,
   appToken: process.env.SLACK_APP_TOKEN,
   logLevel: LogLevel.INFO,
 });
+
+// Bolt doesn't expose SocketModeClient ping/pong options, so patch them before start()
+const socketModeClient = (app as any).receiver?.client;
+if (socketModeClient) {
+  socketModeClient.pingPongLoggingEnabled = false;
+  socketModeClient.clientPingTimeoutMS = 30000;
+}
 
 interface ThreadContext {
   repoName: string;
@@ -93,17 +102,11 @@ function splitMessage(text: string, maxLength = 3900): string[] {
   return chunks;
 }
 
-app.message(async ({ message, say, client }) => {
-  // bot自身のメッセージは無視
-  if (message.subtype === 'bot_message') return;
-  if (!('text' in message) || !message.text) return;
-  if (!('channel' in message)) return;
+app.event('app_mention', async ({ event, say, client }) => {
+  if (!event.text) return;
 
-  console.log('STDOUT:', message);
-
-  const channelId = message.channel;
-  // スレッド内のメッセージの場合は thread_ts、そうでなければ ts をスレッドキーに
-  const threadKey = ('thread_ts' in message && message.thread_ts) ? message.thread_ts : message.ts;
+  const channelId = event.channel;
+  const threadKey = event.thread_ts || event.ts;
 
   // チャンネル制限チェック
   if (!isChannelAllowed(channelId)) {
@@ -111,7 +114,8 @@ app.message(async ({ message, say, client }) => {
     return;
   }
 
-  const text = message.text.trim();
+  // メンション部分（<@U...>）を除去
+  const text = event.text.replace(/<@[A-Z0-9]+>/g, '').trim();
 
   // repos コマンド: 設定済みリポジトリ一覧を表示
   if (text === 'repos' || text === 'list') {
@@ -127,18 +131,21 @@ app.message(async ({ message, say, client }) => {
 
   // help コマンド
   if (text === 'help') {
+    const mention = botUserId ? `<@${botUserId}>` : '@bot';
     await say({
       text: [
         '*使い方:*',
-        '• `repo:リポジトリ名 タスク` - 新規セッション開始',
-        '• スレッド内で続けてメッセージ → 同じセッションで継続',
-        '• `repos` または `list` - リポジトリ一覧を表示',
-        '• `reset` - スレッドのセッションをリセット',
-        '• `help` - このヘルプを表示',
+        `• \`${mention} repo:リポジトリ名 タスク\` - 新規セッション開始`,
+        `• スレッド内で \`${mention} メッセージ\` → 同じセッションで継続`,
+        `• \`${mention} repos\` または \`${mention} list\` - リポジトリ一覧を表示`,
+        `• \`${mention} reset\` - スレッドのセッションをリセット`,
+        `• \`${mention} help\` - このヘルプを表示`,
         '',
         '*例:*',
-        '`repo:my-project このバグを修正して`',
-        '(スレッド内で) `他にも似たバグがないか探して`',
+        `\`${mention} repo:my-project このバグを修正して\``,
+        `(スレッド内で) \`${mention} 他にも似たバグがないか探して\``,
+        '',
+        '_※ このボットはメンション付きメッセージにのみ反応します_',
       ].join('\n'),
       thread_ts: threadKey,
     });
@@ -229,27 +236,16 @@ app.message(async ({ message, say, client }) => {
     }
   };
 
-  let assistantMsgTs: string | undefined;
-
   const onAssistantMessage: AssistantMessageCallback = (text) => {
+    if (!processingMsg.ts) return;
     const preview = text.slice(0, 3000);
     const content = `:speech_balloon: ${preview}${text.length > 3000 ? '\n_...（続き）_' : ''}`;
 
-    if (assistantMsgTs) {
-      client.chat.update({
-        channel: channelId,
-        ts: assistantMsgTs,
-        text: content,
-      }).catch(() => {});
-    } else {
-      client.chat.postMessage({
-        channel: channelId,
-        thread_ts: threadKey,
-        text: content,
-      }).then((res) => {
-        assistantMsgTs = res.ts;
-      }).catch(() => {});
-    }
+    client.chat.update({
+      channel: channelId,
+      ts: processingMsg.ts,
+      text: content,
+    }).catch(() => {});
   };
 
   try {
@@ -307,7 +303,10 @@ app.message(async ({ message, say, client }) => {
 
 (async () => {
   await app.start();
-  console.log('Slack Claude Bot is running!');
+
+  const authResult = await app.client.auth.test();
+  botUserId = authResult.user_id ?? '';
+  console.log(`Slack Claude Bot is running! (bot user: <@${botUserId}>)`);
   console.log('Configured repos:', Object.keys(config.repos).join(', ') || '(none)');
   console.log('Allowed channels:', config.allowedChannels.length > 0 ? config.allowedChannels.join(', ') : '(all)');
 })();
