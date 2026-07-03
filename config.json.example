@@ -1,9 +1,13 @@
 {
+  "$schema": "./config.schema.json",
   "allowedChannels": [],
+  "allowedUsers": [],
   "repos": {
-    "example": "/Users/your-name/works/example-repo"
+    "example": "/Users/your-name/works/example-repo",
+    "another-repo": "~/works/another-repo"
   },
   "maxTurns": 10,
   "timeoutMs": 600000,
-  "allowedTools": ["Read", "Bash", "Edit", "Write", "Glob", "Grep"]
+  "allowedTools": ["Read", "Bash", "Edit", "Write", "Glob", "Grep"],
+  "skipPermissions": true
 }
