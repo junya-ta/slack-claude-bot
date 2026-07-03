@@ -1,15 +1,42 @@
 import 'dotenv/config';
-import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, readdirSync, statSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { App, LogLevel } from '@slack/bolt';
-import { config, getRepoPath, isChannelAllowed } from './config.js';
-import { runClaude, type AssistantMessageCallback } from './claude.js';
+import type { ChildProcess } from 'child_process';
+import {
+  loadConfig,
+  requireEnv,
+  getRepoPath,
+  isChannelAllowed,
+  isUserAllowed,
+  type Config,
+} from './config.js';
+import { parseMessage, splitMessage } from './utils.js';
+import { runClaude } from './claude.js';
+import { logger } from './logger.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const THREAD_CONTEXT_DIR = join(__dirname, '..', 'tmp', 'threads');
+const THREAD_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7日
+const CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000; // 1日
+
+// 起動前に設定・環境変数を検証（不備があれば分かりやすく落とす）
+let config: Config;
+try {
+  requireEnv();
+  config = loadConfig();
+} catch (err) {
+  logger.error(`[Startup] ${(err as Error).message}`);
+  process.exit(1);
+}
 
 let botUserId = '';
+
+// スレッド単位の実行ロック（同一スレッドの並行実行を防止）
+const busyThreads = new Set<string>();
+// 実行中の子プロセス（graceful shutdown 用）
+const runningProcs = new Set<ChildProcess>();
 
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
@@ -19,7 +46,8 @@ const app = new App({
 });
 
 // Bolt doesn't expose SocketModeClient ping/pong options, so patch them before start()
-const socketModeClient = (app as any).receiver?.client;
+const socketModeClient = (app as unknown as { receiver?: { client?: Record<string, unknown> } }).receiver
+  ?.client;
 if (socketModeClient) {
   socketModeClient.pingPongLoggingEnabled = false;
   socketModeClient.clientPingTimeoutMS = 30000;
@@ -41,7 +69,7 @@ function loadThreadContext(threadKey: string): ThreadContext | undefined {
     if (!existsSync(filePath)) return undefined;
     return JSON.parse(readFileSync(filePath, 'utf-8')) as ThreadContext;
   } catch (err) {
-    console.error(`[ThreadContext] Failed to load ${threadKey}:`, err);
+    logger.error(`[ThreadContext] Failed to load ${threadKey}:`, err);
     return undefined;
   }
 }
@@ -50,9 +78,9 @@ function saveThreadContext(threadKey: string, ctx: ThreadContext): void {
   try {
     mkdirSync(THREAD_CONTEXT_DIR, { recursive: true });
     writeFileSync(threadContextPath(threadKey), JSON.stringify(ctx, null, 2));
-    console.log(`[ThreadContext] Saved ${threadKey}:`, ctx);
+    logger.debug(`[ThreadContext] Saved ${threadKey}`);
   } catch (err) {
-    console.error(`[ThreadContext] Failed to save ${threadKey}:`, err);
+    logger.error(`[ThreadContext] Failed to save ${threadKey}:`, err);
   }
 }
 
@@ -61,45 +89,94 @@ function deleteThreadContext(threadKey: string): boolean {
   try {
     if (!existsSync(filePath)) return false;
     unlinkSync(filePath);
-    console.log(`[ThreadContext] Deleted ${threadKey}`);
+    logger.debug(`[ThreadContext] Deleted ${threadKey}`);
     return true;
   } catch (err) {
-    console.error(`[ThreadContext] Failed to delete ${threadKey}:`, err);
+    logger.error(`[ThreadContext] Failed to delete ${threadKey}:`, err);
     return false;
   }
 }
 
-// repo:name 形式でリポジトリ名を抽出（タスクは任意。repo: name のようにコロン後に空白も可）
-function parseMessage(text: string): { repoName: string | null; task: string } {
-  const match = text.match(/^repo:\s*(\S+)(?:\s+([\s\S]+))?$/);
-  if (match) {
-    return { repoName: match[1], task: (match[2] ?? '').trim() };
+/** TTLを過ぎた古いスレッドコンテキストを削除する。 */
+function cleanupThreadContexts(): void {
+  try {
+    if (!existsSync(THREAD_CONTEXT_DIR)) return;
+    const now = Date.now();
+    let removed = 0;
+    for (const file of readdirSync(THREAD_CONTEXT_DIR)) {
+      if (!file.endsWith('.json')) continue;
+      const filePath = join(THREAD_CONTEXT_DIR, file);
+      try {
+        if (now - statSync(filePath).mtimeMs > THREAD_TTL_MS) {
+          unlinkSync(filePath);
+          removed++;
+        }
+      } catch {
+        // 個別ファイルのエラーは無視
+      }
+    }
+    if (removed > 0) logger.info(`[Cleanup] Removed ${removed} stale thread context(s)`);
+  } catch (err) {
+    logger.error('[Cleanup] Failed:', err);
   }
-  return { repoName: null, task: text };
 }
 
-// 長いテキストを分割
-function splitMessage(text: string, maxLength = 3900): string[] {
-  const chunks: string[] = [];
-  let remaining = text;
+/**
+ * 進捗とアシスタントメッセージを1つのメッセージに集約し、
+ * 更新を直列化＋スロットルして表示崩れ・レート制限を防ぐライブステータス。
+ */
+function createLiveStatus(client: App['client'], channelId: string, ts: string | undefined, header: string) {
+  const UPDATE_INTERVAL = 1500;
+  const progressLines: string[] = [];
+  let assistantPreview = '';
+  let chain: Promise<unknown> = Promise.resolve();
+  let lastUpdate = 0;
+  let timer: NodeJS.Timeout | undefined;
 
-  while (remaining.length > 0) {
-    if (remaining.length <= maxLength) {
-      chunks.push(remaining);
-      break;
+  function render(): string {
+    const parts = [header];
+    if (assistantPreview) parts.push(`\n:speech_balloon: ${assistantPreview}`);
+    if (progressLines.length > 0) {
+      parts.push(`\n\`\`\`\n${progressLines.slice(-5).join('\n')}\n\`\`\``);
     }
-
-    // 改行で区切れる位置を探す
-    let splitIndex = remaining.lastIndexOf('\n', maxLength);
-    if (splitIndex === -1 || splitIndex < maxLength / 2) {
-      splitIndex = maxLength;
-    }
-
-    chunks.push(remaining.slice(0, splitIndex));
-    remaining = remaining.slice(splitIndex).trimStart();
+    return parts.join('');
   }
 
-  return chunks;
+  function flush(): void {
+    if (!ts) return;
+    lastUpdate = Date.now();
+    chain = chain.then(() => client.chat.update({ channel: channelId, ts, text: render() }).catch(() => {}));
+  }
+
+  function schedule(): void {
+    const elapsed = Date.now() - lastUpdate;
+    if (elapsed >= UPDATE_INTERVAL) {
+      flush();
+    } else if (!timer) {
+      timer = setTimeout(() => {
+        timer = undefined;
+        flush();
+      }, UPDATE_INTERVAL - elapsed);
+    }
+  }
+
+  return {
+    setProgress(line: string): void {
+      progressLines.push(line);
+      schedule();
+    },
+    setAssistant(text: string): void {
+      assistantPreview = text.slice(0, 1500);
+      schedule();
+    },
+    async done(): Promise<void> {
+      if (timer) {
+        clearTimeout(timer);
+        timer = undefined;
+      }
+      await chain;
+    },
+  };
 }
 
 app.event('app_mention', async ({ event, say, client }) => {
@@ -107,29 +184,29 @@ app.event('app_mention', async ({ event, say, client }) => {
 
   const channelId = event.channel;
   const threadKey = event.thread_ts || event.ts;
+  const userId = event.user;
 
-  // チャンネル制限チェック
-  if (!isChannelAllowed(channelId)) {
-    console.log(`[Skip] Channel ${channelId} is not allowed`);
+  if (!isChannelAllowed(config, channelId)) {
+    logger.debug(`[Skip] Channel ${channelId} is not allowed`);
     return;
   }
 
-  // メンション部分（<@U...>）を除去
+  if (!isUserAllowed(config, userId)) {
+    logger.debug(`[Skip] User ${userId} is not allowed`);
+    await say({ text: 'このボットを使用する権限がありません。', thread_ts: threadKey });
+    return;
+  }
+
   const text = event.text.replace(/<@[A-Z0-9]+>/g, '').trim();
 
-  // repos コマンド: 設定済みリポジトリ一覧を表示
   if (text === 'repos' || text === 'list') {
     const repoList = Object.entries(config.repos)
       .map(([name, path]) => `• \`${name}\` → ${path}`)
       .join('\n');
-    await say({
-      text: `*設定済みリポジトリ一覧:*\n${repoList || '(なし)'}`,
-      thread_ts: threadKey,
-    });
+    await say({ text: `*設定済みリポジトリ一覧:*\n${repoList || '(なし)'}`, thread_ts: threadKey });
     return;
   }
 
-  // help コマンド
   if (text === 'help') {
     const mention = botUserId ? `<@${botUserId}>` : '@bot';
     await say({
@@ -153,7 +230,6 @@ app.event('app_mention', async ({ event, say, client }) => {
     return;
   }
 
-  // reset コマンド: スレッドのセッションをリセット
   if (text === 'reset') {
     if (deleteThreadContext(threadKey)) {
       await say({
@@ -161,28 +237,30 @@ app.event('app_mention', async ({ event, say, client }) => {
         thread_ts: threadKey,
       });
     } else {
-      await say({
-        text: 'このスレッドにはアクティブなセッションがありません。',
-        thread_ts: threadKey,
-      });
+      await say({ text: 'このスレッドにはアクティブなセッションがありません。', thread_ts: threadKey });
     }
     return;
   }
 
-  // 既存のスレッドコンテキストを確認
-  const existingContext = loadThreadContext(threadKey);
-  console.log(`[ThreadContext] threadKey=${threadKey}, existingContext=`, existingContext);
+  // 同一スレッドで既に処理中なら並行実行を避ける
+  if (busyThreads.has(threadKey)) {
+    await say({
+      text: ':warning: このスレッドは現在処理中です。完了までお待ちください。',
+      thread_ts: threadKey,
+    });
+    return;
+  }
 
+  const existingContext = loadThreadContext(threadKey);
   const { repoName, task } = parseMessage(text);
-  console.log(`[ParseMessage] text="${text}", repoName=${repoName ?? 'null'}, task="${task}"`);
+  logger.debug(`[ParseMessage] repoName=${repoName ?? 'null'}, task="${task}"`);
 
   let currentRepoName: string;
   let currentRepoPath: string;
   let resumeSessionId: string | undefined;
 
   if (repoName) {
-    // 新しいリポジトリ指定がある場合
-    const repoPath = getRepoPath(repoName);
+    const repoPath = getRepoPath(config, repoName);
     if (!repoPath) {
       const availableRepos = Object.keys(config.repos).join(', ');
       await say({
@@ -193,27 +271,19 @@ app.event('app_mention', async ({ event, say, client }) => {
     }
     currentRepoName = repoName;
     currentRepoPath = repoPath;
-    // タスクなしの場合はコンテキストだけ保存してセッション待機
     if (!task) {
-      saveThreadContext(threadKey, {
-        repoName: currentRepoName,
-        repoPath: currentRepoPath,
-        sessionId: '',
-      });
+      saveThreadContext(threadKey, { repoName: currentRepoName, repoPath: currentRepoPath, sessionId: '' });
       await say({
         text: `セッションを開始しました (repo: \`${currentRepoName}\`)。\nこのスレッドでメンションしてタスクを送ってください。`,
         thread_ts: threadKey,
       });
       return;
     }
-    // 新しいリポジトリなのでセッションはリセット
   } else if (existingContext) {
-    // スレッド内で既存コンテキストを継続
     currentRepoName = existingContext.repoName;
     currentRepoPath = existingContext.repoPath;
     resumeSessionId = existingContext.sessionId || undefined;
   } else {
-    // コンテキストがなく、リポジトリ指定もない
     await say({
       text: '`repo:リポジトリ名` を指定してください。\n例: `repo:my-project このバグを修正して`',
       thread_ts: threadKey,
@@ -223,82 +293,48 @@ app.event('app_mention', async ({ event, say, client }) => {
 
   const taskText = repoName ? task : text;
 
-  // 処理中メッセージ
+  busyThreads.add(threadKey);
   const statusPrefix = resumeSessionId ? '(継続)' : '(新規)';
-  const processingMsg = await say({
-    text: `:hourglass_flowing_sand: ${statusPrefix} Claude Code を実行中... (repo: ${currentRepoName})\n_開始中..._`,
-    thread_ts: threadKey,
-  });
+  const header = `:hourglass_flowing_sand: ${statusPrefix} Claude Code を実行中... (repo: ${currentRepoName})`;
 
-  const progressLines: string[] = [];
-  let lastUpdateTime = 0;
-  const UPDATE_INTERVAL = 2000;
-
-  const updateProgress = async (status: string) => {
-    progressLines.push(status);
-    const recentLines = progressLines.slice(-5);
-
-    const now = Date.now();
-    if (now - lastUpdateTime < UPDATE_INTERVAL) return;
-    lastUpdateTime = now;
-
-    if (processingMsg.ts) {
-      await client.chat.update({
-        channel: channelId,
-        ts: processingMsg.ts,
-        text: `:hourglass_flowing_sand: ${statusPrefix} Claude Code を実行中... (repo: ${currentRepoName})\n\`\`\`\n${recentLines.join('\n')}\n\`\`\``,
-      }).catch(() => {});
-    }
-  };
-
-  const onAssistantMessage: AssistantMessageCallback = (text) => {
-    if (!processingMsg.ts) return;
-    const preview = text.slice(0, 3000);
-    const content = `:speech_balloon: ${preview}${text.length > 3000 ? '\n_...（続き）_' : ''}`;
-
-    client.chat.update({
-      channel: channelId,
-      ts: processingMsg.ts,
-      text: content,
-    }).catch(() => {});
-  };
+  const processingMsg = await say({ text: `${header}\n_開始中..._`, thread_ts: threadKey });
+  const live = createLiveStatus(client, channelId, processingMsg.ts, header);
 
   try {
-    const result = await runClaude(taskText, currentRepoPath, updateProgress, resumeSessionId, onAssistantMessage);
+    const result = await runClaude({
+      task: taskText,
+      repoPath: currentRepoPath,
+      config,
+      onProgress: (status) => live.setProgress(status),
+      onAssistantMessage: (msg) => live.setAssistant(msg),
+      resumeSessionId,
+      onSpawn: (proc) => {
+        runningProcs.add(proc);
+        proc.on('close', () => runningProcs.delete(proc));
+      },
+    });
 
-    // 処理中メッセージを削除
+    await live.done();
+
     if (processingMsg.ts) {
-      await client.chat.delete({
-        channel: channelId,
-        ts: processingMsg.ts,
-      }).catch(() => {});
+      await client.chat.delete({ channel: channelId, ts: processingMsg.ts }).catch(() => {});
     }
 
     if (!result.success) {
-      await say({
-        text: `:x: エラー\n\`\`\`\n${result.error}\n\`\`\``,
-        thread_ts: threadKey,
-      });
+      await say({ text: `:x: エラー\n\`\`\`\n${result.error}\n\`\`\``, thread_ts: threadKey });
       return;
     }
 
-    // セッションIDを保存（sessionIdが取れなくてもrepo情報は保存）
     const sessionId = result.sessionId || '';
-    console.log(`[ThreadContext] sessionId from Claude: "${sessionId}"`);
     saveThreadContext(threadKey, {
       repoName: currentRepoName,
       repoPath: currentRepoPath,
       sessionId,
     });
 
-    const responseText = result.result || '(応答なし)';
-    const chunks = splitMessage(responseText);
-
+    const chunks = splitMessage(result.result || '(応答なし)');
     for (const chunk of chunks) {
-      await say({
-        text: chunk,
-        thread_ts: threadKey,
-      });
+      await say({ text: chunk, thread_ts: threadKey });
     }
 
     if (!resumeSessionId) {
@@ -308,19 +344,58 @@ app.event('app_mention', async ({ event, say, client }) => {
       });
     }
   } catch (err) {
+    await live.done().catch(() => {});
     await say({
       text: `:x: 予期しないエラー: ${err instanceof Error ? err.message : String(err)}`,
       thread_ts: threadKey,
     });
+  } finally {
+    busyThreads.delete(threadKey);
   }
 });
+
+let cleanupTimer: NodeJS.Timeout | undefined;
+let shuttingDown = false;
+
+async function shutdown(signal: string): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  logger.info(`[Shutdown] Received ${signal}, cleaning up...`);
+
+  if (cleanupTimer) clearInterval(cleanupTimer);
+
+  for (const proc of runningProcs) {
+    try {
+      proc.kill('SIGTERM');
+    } catch {
+      // 無視
+    }
+  }
+
+  try {
+    await app.stop();
+  } catch (err) {
+    logger.error('[Shutdown] Error stopping app:', err);
+  }
+  process.exit(0);
+}
+
+process.on('SIGINT', () => void shutdown('SIGINT'));
+process.on('SIGTERM', () => void shutdown('SIGTERM'));
 
 (async () => {
   await app.start();
 
   const authResult = await app.client.auth.test();
   botUserId = authResult.user_id ?? '';
-  console.log(`Slack Claude Bot is running! (bot user: <@${botUserId}>)`);
-  console.log('Configured repos:', Object.keys(config.repos).join(', ') || '(none)');
-  console.log('Allowed channels:', config.allowedChannels.length > 0 ? config.allowedChannels.join(', ') : '(all)');
+
+  cleanupThreadContexts();
+  cleanupTimer = setInterval(cleanupThreadContexts, CLEANUP_INTERVAL_MS);
+
+  logger.info(`Slack Claude Bot is running! (bot user: <@${botUserId}>)`);
+  logger.info(`Configured repos: ${Object.keys(config.repos).join(', ') || '(none)'}`);
+  logger.info(
+    `Allowed channels: ${config.allowedChannels.length > 0 ? config.allowedChannels.join(', ') : '(all)'}`
+  );
+  logger.info(`Allowed users: ${config.allowedUsers.length > 0 ? config.allowedUsers.join(', ') : '(all)'}`);
 })();

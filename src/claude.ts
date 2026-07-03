@@ -1,11 +1,20 @@
-import { spawn } from 'child_process';
-import { config, expandPath } from './config.js';
+import { spawn, type ChildProcess } from 'child_process';
+import type { Config } from './config.js';
+import { expandPath } from './utils.js';
+import { logger } from './logger.js';
 
-interface ClaudeResult {
+export interface ClaudeResult {
   success: boolean;
   result?: string;
   sessionId?: string;
   error?: string;
+}
+
+interface ContentBlock {
+  type: string;
+  text?: string;
+  name?: string;
+  input?: Record<string, unknown>;
 }
 
 interface StreamEvent {
@@ -14,10 +23,8 @@ interface StreamEvent {
   result?: string;
   message?: {
     type: string;
-    content?: Array<{ type: string; text?: string }>;
+    content?: ContentBlock[];
   };
-  tool_name?: string;
-  tool_input?: Record<string, unknown>;
   session_id?: string;
 }
 
@@ -29,172 +36,172 @@ export interface AssistantMessageCallback {
   (text: string): void;
 }
 
-export async function runClaude(
-  task: string,
-  repoPath: string,
-  onProgress?: ProgressCallback,
-  resumeSessionId?: string,
-  onAssistantMessage?: AssistantMessageCallback
-): Promise<ClaudeResult> {
+export interface RunClaudeOptions {
+  task: string;
+  repoPath: string;
+  config: Config;
+  onProgress?: ProgressCallback;
+  onAssistantMessage?: AssistantMessageCallback;
+  resumeSessionId?: string;
+  /** 起動された子プロセスを受け取るコールバック（graceful shutdown 用） */
+  onSpawn?: (proc: ChildProcess) => void;
+}
+
+/**
+ * ツール使用ブロックから進捗表示用の詳細文字列を組み立てる。
+ */
+function toolDetail(name: string, input: Record<string, unknown> | undefined): string {
+  if (!input) return '';
+  if ((name === 'Read' || name === 'Edit' || name === 'Write') && typeof input.file_path === 'string') {
+    return ` → ${input.file_path}`;
+  }
+  if ((name === 'Grep' || name === 'Glob') && typeof input.pattern === 'string') {
+    return ` → ${name === 'Grep' ? `"${input.pattern}"` : input.pattern}`;
+  }
+  if (name === 'Bash' && typeof input.command === 'string') {
+    const cmd = input.command;
+    return ` → ${cmd.slice(0, 50)}${cmd.length > 50 ? '...' : ''}`;
+  }
+  return '';
+}
+
+export async function runClaude(options: RunClaudeOptions): Promise<ClaudeResult> {
+  const { task, repoPath, config, onProgress, onAssistantMessage, resumeSessionId, onSpawn } = options;
+
   return new Promise((resolve) => {
     const args = [
-      '-p', task,
-      '--output-format', 'stream-json',
+      '-p',
+      task,
+      '--output-format',
+      'stream-json',
       '--verbose',
-      '--dangerously-skip-permissions',
-      '--max-turns', String(config.maxTurns),
+      '--max-turns',
+      String(config.maxTurns),
     ];
 
-    // セッション継続の場合
+    if (config.skipPermissions) {
+      args.push('--dangerously-skip-permissions');
+    } else if (config.allowedTools.length > 0) {
+      args.push('--allowedTools', config.allowedTools.join(','));
+    }
+
     if (resumeSessionId) {
       args.push('--resume', resumeSessionId);
     }
 
     const cwd = expandPath(repoPath);
 
-    console.log(`[Claude] Running in ${cwd}`);
-    console.log(`[Claude] Task: ${task}`);
-    console.log(`[Claude] Resume: ${resumeSessionId || 'new session'}`);
-    console.log(`[Claude] Args: ${args.join(' ')}`);
+    logger.info(`[Claude] Running in ${cwd}`);
+    logger.debug(`[Claude] Task: ${task}`);
+    logger.debug(`[Claude] Resume: ${resumeSessionId || 'new session'}`);
+    logger.debug(`[Claude] Args: ${args.join(' ')}`);
 
-    const proc = spawn('claude', args, {
-      cwd,
-      env: process.env,
-      stdio: ['inherit', 'pipe', 'pipe'],
-    });
+    let proc: ChildProcess;
+    try {
+      proc = spawn('claude', args, {
+        cwd,
+        env: process.env,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch (err) {
+      resolve({ success: false, error: `Failed to spawn claude: ${(err as Error).message}` });
+      return;
+    }
 
-    console.log(`[Claude] Process spawned, PID: ${proc.pid}`);
+    onSpawn?.(proc);
+    logger.debug(`[Claude] Process spawned, PID: ${proc.pid}`);
 
     let lastResult = '';
     let sessionId = '';
     let buffer = '';
     let turnCount = 0;
+    let settled = false;
 
-    proc.stdout.on('data', (data) => {
-      const chunk = data.toString();
-      console.log(`[Claude][stdout] ${chunk.slice(0, 200)}`);
-      buffer += chunk;
+    const finish = (result: ClaudeResult) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
 
-      // 改行で分割して各JSONを処理
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || ''; // 最後の不完全な行を保持
+    const handleEvent = (event: StreamEvent) => {
+      if (event.session_id && !sessionId) {
+        sessionId = event.session_id;
+        logger.debug(`[Claude] session_id captured: ${sessionId}`);
+      }
 
-      for (const line of lines) {
-        if (!line.trim()) continue;
-
-        try {
-          const event: StreamEvent = JSON.parse(line);
-
-          if (event.session_id && !sessionId) {
-            sessionId = event.session_id;
-            console.log(`[Claude] session_id captured: ${sessionId}`);
-          }
-
-          // ツール使用を検知
-          if (event.type === 'tool_use') {
+      if (event.type === 'assistant' && event.message?.content) {
+        const textParts: string[] = [];
+        for (const block of event.message.content) {
+          if (block.type === 'text' && block.text) {
+            textParts.push(block.text);
+          } else if (block.type === 'tool_use') {
             turnCount++;
-            const toolName = event.tool_name || 'unknown';
-            let detail = '';
-
-            if (event.tool_input) {
-              if (toolName === 'Read' && event.tool_input.file_path) {
-                detail = ` → ${event.tool_input.file_path}`;
-              } else if (toolName === 'Grep' && event.tool_input.pattern) {
-                detail = ` → "${event.tool_input.pattern}"`;
-              } else if (toolName === 'Glob' && event.tool_input.pattern) {
-                detail = ` → ${event.tool_input.pattern}`;
-              } else if (toolName === 'Edit' && event.tool_input.file_path) {
-                detail = ` → ${event.tool_input.file_path}`;
-              } else if (toolName === 'Bash' && event.tool_input.command) {
-                const cmd = String(event.tool_input.command);
-                detail = ` → ${cmd.slice(0, 50)}${cmd.length > 50 ? '...' : ''}`;
-              }
-            }
-
-            const status = `[${turnCount}/${config.maxTurns}] ${toolName}${detail}`;
-            console.log(`[Claude] ${status}`);
+            const toolName = block.name || 'unknown';
+            const status = `[${turnCount}/${config.maxTurns}] ${toolName}${toolDetail(toolName, block.input)}`;
+            logger.debug(`[Claude] ${status}`);
             onProgress?.(status);
           }
-
-          // アシスタントメッセージ
-          if (event.type === 'assistant' && event.message?.content) {
-            const textContent = event.message.content
-              .filter(c => c.type === 'text' && c.text)
-              .map(c => c.text)
-              .join('\n');
-            if (textContent) {
-              lastResult = textContent;
-              onAssistantMessage?.(textContent);
-            }
-          }
-
-          // result イベント（最終結果）
-          if (event.type === 'result' && event.result) {
-            lastResult = event.result;
-          }
-
-        } catch {
-          // JSON解析失敗は無視
+        }
+        const textContent = textParts.join('\n');
+        if (textContent) {
+          lastResult = textContent;
+          onAssistantMessage?.(textContent);
         }
       }
+
+      if (event.type === 'result' && event.result) {
+        lastResult = event.result;
+      }
+    };
+
+    const processLine = (line: string) => {
+      if (!line.trim()) return;
+      try {
+        handleEvent(JSON.parse(line) as StreamEvent);
+      } catch {
+        // JSON解析失敗は無視（不完全な行や非JSON出力）
+      }
+    };
+
+    proc.stdout?.on('data', (data: Buffer) => {
+      const chunk = data.toString();
+      logger.debug(`[Claude][stdout] ${chunk.slice(0, 200)}`);
+      buffer += chunk;
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+      for (const line of lines) processLine(line);
     });
 
     let stderr = '';
-    proc.stderr.on('data', (data) => {
+    proc.stderr?.on('data', (data: Buffer) => {
       const chunk = data.toString();
-      console.log(`[Claude][stderr] ${chunk}`);
+      logger.debug(`[Claude][stderr] ${chunk}`);
       stderr += chunk;
     });
 
     const timeout = setTimeout(() => {
       proc.kill('SIGTERM');
-      resolve({
-        success: false,
-        error: `Timeout after ${config.timeoutMs / 1000} seconds`,
-      });
+      finish({ success: false, error: `Timeout after ${config.timeoutMs / 1000} seconds` });
     }, config.timeoutMs);
 
     proc.on('close', (code) => {
       clearTimeout(timeout);
 
-      // 残りのバッファを処理
-      if (buffer.trim()) {
-        try {
-          const event: StreamEvent = JSON.parse(buffer);
-          if (event.type === 'result' && event.result) {
-            lastResult = event.result;
-          }
-          if (event.session_id) {
-            sessionId = event.session_id;
-          }
-        } catch {
-          // 無視
-        }
-      }
+      if (buffer.trim()) processLine(buffer);
 
-      console.log(`[Claude] Process exited with code ${code}, sessionId="${sessionId}"`);
+      logger.info(`[Claude] Process exited with code ${code}, sessionId="${sessionId}"`);
 
       if (code !== 0 && !lastResult) {
-        resolve({
-          success: false,
-          error: stderr || `Exit code: ${code}`,
-        });
+        finish({ success: false, error: stderr.trim() || `Exit code: ${code}` });
         return;
       }
 
-      resolve({
-        success: true,
-        result: lastResult || '(応答なし)',
-        sessionId,
-      });
+      finish({ success: true, result: lastResult || '(応答なし)', sessionId });
     });
 
     proc.on('error', (err) => {
       clearTimeout(timeout);
-      resolve({
-        success: false,
-        error: `Process error: ${err.message}`,
-      });
+      finish({ success: false, error: `Process error: ${err.message}` });
     });
   });
 }
