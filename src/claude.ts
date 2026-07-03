@@ -1,5 +1,5 @@
 import { spawn } from 'child_process';
-import { config } from './config.js';
+import { config, expandPath } from './config.js';
 
 interface ClaudeResult {
   success: boolean;
@@ -50,13 +50,15 @@ export async function runClaude(
       args.push('--resume', resumeSessionId);
     }
 
-    console.log(`[Claude] Running in ${repoPath}`);
+    const cwd = expandPath(repoPath);
+
+    console.log(`[Claude] Running in ${cwd}`);
     console.log(`[Claude] Task: ${task}`);
     console.log(`[Claude] Resume: ${resumeSessionId || 'new session'}`);
     console.log(`[Claude] Args: ${args.join(' ')}`);
 
     const proc = spawn('claude', args, {
-      cwd: repoPath,
+      cwd,
       env: process.env,
       stdio: ['inherit', 'pipe', 'pipe'],
     });

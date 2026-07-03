@@ -69,11 +69,11 @@ function deleteThreadContext(threadKey: string): boolean {
   }
 }
 
-// repo:name 形式でリポジトリ名を抽出
+// repo:name 形式でリポジトリ名を抽出（タスクは任意。repo: name のようにコロン後に空白も可）
 function parseMessage(text: string): { repoName: string | null; task: string } {
-  const match = text.match(/^repo:(\S+)\s+(.+)$/s);
+  const match = text.match(/^repo:\s*(\S+)(?:\s+([\s\S]+))?$/);
   if (match) {
-    return { repoName: match[1], task: match[2].trim() };
+    return { repoName: match[1], task: (match[2] ?? '').trim() };
   }
   return { repoName: null, task: text };
 }
@@ -135,7 +135,8 @@ app.event('app_mention', async ({ event, say, client }) => {
     await say({
       text: [
         '*使い方:*',
-        `• \`${mention} repo:リポジトリ名 タスク\` - 新規セッション開始`,
+        `• \`${mention} repo:リポジトリ名\` - セッション開始（タスクは後からでも可）`,
+        `• \`${mention} repo:リポジトリ名 タスク\` - セッション開始＋即実行`,
         `• スレッド内で \`${mention} メッセージ\` → 同じセッションで継続`,
         `• \`${mention} repos\` または \`${mention} list\` - リポジトリ一覧を表示`,
         `• \`${mention} reset\` - スレッドのセッションをリセット`,
@@ -173,6 +174,7 @@ app.event('app_mention', async ({ event, say, client }) => {
   console.log(`[ThreadContext] threadKey=${threadKey}, existingContext=`, existingContext);
 
   const { repoName, task } = parseMessage(text);
+  console.log(`[ParseMessage] text="${text}", repoName=${repoName ?? 'null'}, task="${task}"`);
 
   let currentRepoName: string;
   let currentRepoPath: string;
@@ -191,6 +193,19 @@ app.event('app_mention', async ({ event, say, client }) => {
     }
     currentRepoName = repoName;
     currentRepoPath = repoPath;
+    // タスクなしの場合はコンテキストだけ保存してセッション待機
+    if (!task) {
+      saveThreadContext(threadKey, {
+        repoName: currentRepoName,
+        repoPath: currentRepoPath,
+        sessionId: '',
+      });
+      await say({
+        text: `セッションを開始しました (repo: \`${currentRepoName}\`)。\nこのスレッドでメンションしてタスクを送ってください。`,
+        thread_ts: threadKey,
+      });
+      return;
+    }
     // 新しいリポジトリなのでセッションはリセット
   } else if (existingContext) {
     // スレッド内で既存コンテキストを継続
@@ -258,7 +273,6 @@ app.event('app_mention', async ({ event, say, client }) => {
         ts: processingMsg.ts,
       }).catch(() => {});
     }
-
 
     if (!result.success) {
       await say({
