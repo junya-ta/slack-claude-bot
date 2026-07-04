@@ -1,0 +1,54 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Slack Claude Bot config",
+  "type": "object",
+  "required": ["repos"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "エディタ補完用のスキーマ参照。実行時は無視されます。"
+    },
+    "allowedChannels": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": [],
+      "description": "ボットを動作させるSlackチャンネルIDの配列。空配列なら全チャンネルで動作します。"
+    },
+    "allowedUsers": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": [],
+      "description": "ボットの利用を許可するSlackユーザーIDの配列。空配列なら全ユーザーが利用可能です。"
+    },
+    "repos": {
+      "type": "object",
+      "description": "操作対象リポジトリ。{ \"名前\": \"絶対パスまたは ~ 始まりのパス\" } 形式。",
+      "additionalProperties": { "type": "string", "minLength": 1 },
+      "minProperties": 1
+    },
+    "maxTurns": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "default": 10,
+      "description": "Claude Code の最大ターン数。"
+    },
+    "timeoutMs": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "default": 600000,
+      "description": "Claude Code 実行のタイムアウト（ミリ秒）。"
+    },
+    "allowedTools": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": ["Read", "Bash", "Edit", "Write", "Glob", "Grep"],
+      "description": "skipPermissions が false のとき Claude に渡す --allowedTools のリスト。"
+    },
+    "skipPermissions": {
+      "type": "boolean",
+      "default": true,
+      "description": "true で --dangerously-skip-permissions を付与（全ツール許可）。false で allowedTools のみに制限。"
+    }
+  }
+}

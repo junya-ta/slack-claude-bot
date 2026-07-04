@@ -9,8 +9,10 @@ SlackからClaude Code CLIを呼び出し、ローカルリポジトリに対し
 - **メンション駆動** — `@bot` 付きメッセージにのみ反応。通常の会話を邪魔しない
 - **マルチリポジトリ対応** — `config.json` に複数のリポジトリを登録し、メッセージで切り替え可能
 - **スレッドでセッション継続** — 同一スレッド内のやり取りは同じClaude Codeセッションとして継続。文脈を保ったまま追加指示が可能
-- **リアルタイム進捗表示** — Claude Codeのツール実行状況（ファイル読み込み、Grep、編集など）をSlack上にリアルタイムで表示
-- **チャンネル制限** — 許可されたチャンネルでのみ動作するよう制御可能
+- **リアルタイム進捗表示** — Claude Codeのツール実行状況（ファイル読み込み、Grep、編集など）をSlack上にリアルタイムで表示。進捗とメッセージ更新は直列化・スロットルされ、表示崩れやレート制限を回避
+- **アクセス制限** — 許可されたチャンネル／ユーザーでのみ動作するよう制御可能
+- **同時実行の抑制** — 同一スレッドでの並行実行をロックで防止し、セッションの競合を回避
+- **安全な終了** — `SIGINT`/`SIGTERM` で実行中のClaudeプロセスを片付けてから終了
 
 ## アーキテクチャ
 
@@ -21,22 +23,22 @@ Slack ──(Socket Mode)──▶ Node.js (Bolt) ──(子プロセス)──�
                               ◀──────────────────────────────────┘
 ```
 
-| コンポーネント | 技術 |
-|---|---|
-| Slack連携 | [Slack Bolt for JavaScript](https://slack.dev/bolt-js/) / Socket Mode |
-| AI実行 | [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code/overview) (`--output-format stream-json`) |
-| ランタイム | Node.js (ESM / TypeScript) |
-| セッション管理 | ファイルベース (`tmp/threads/`) |
+| コンポーネント | 技術                                                                                                       |
+| -------------- | ---------------------------------------------------------------------------------------------------------- |
+| Slack連携      | [Slack Bolt for JavaScript](https://slack.dev/bolt-js/) / Socket Mode                                      |
+| AI実行         | [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code/overview) (`--output-format stream-json`) |
+| ランタイム     | Node.js (ESM / TypeScript)                                                                                 |
+| セッション管理 | ファイルベース (`tmp/threads/`)                                                                            |
 
 ## 前提条件
 
-| 必要なもの | バージョン / 詳細 |
-|---|---|
-| **Node.js** | v18 以上（ES2022 / ESM を使用） |
-| **npm** | Node.js に同梱のもので可 |
-| **Claude Code CLI** | `claude` コマンドがPATH上で実行できること（[インストール手順](https://docs.anthropic.com/en/docs/claude-code/overview)） |
-| **Anthropic APIキー** | Claude Code CLI の認証が完了していること（`claude` を一度実行してログイン） |
-| **Slackワークスペース** | Slack App を作成・インストールできる管理者権限 |
+| 必要なもの              | バージョン / 詳細                                                                                                        |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| **Node.js**             | v18 以上（ES2022 / ESM を使用）                                                                                          |
+| **npm**                 | Node.js に同梱のもので可                                                                                                 |
+| **Claude Code CLI**     | `claude` コマンドがPATH上で実行できること（[インストール手順](https://docs.anthropic.com/en/docs/claude-code/overview)） |
+| **Anthropic APIキー**   | Claude Code CLI の認証が完了していること（`claude` を一度実行してログイン）                                              |
+| **Slackワークスペース** | Slack App を作成・インストールできる管理者権限                                                                           |
 
 > **注意**: このボットは `claude` コマンドを子プロセスとして起動し、`--dangerously-skip-permissions` フラグ付きで実行します。信頼できるネットワーク・チャンネルでのみ使用してください。
 
@@ -86,10 +88,15 @@ cp .env.example .env
 ```
 
 `.env` を編集:
+
 ```
 SLACK_BOT_TOKEN=xoxb-your-bot-token-here
 SLACK_APP_TOKEN=xapp-your-app-token-here
+# 任意: debug | info | warn | error （デフォルト: info）
+LOG_LEVEL=info
 ```
+
+`SLACK_BOT_TOKEN` / `SLACK_APP_TOKEN` は必須です。未設定の場合、起動時にエラーで停止します。
 
 ### 7. リポジトリ設定
 
@@ -98,28 +105,43 @@ cp config.json.example config.json
 ```
 
 `config.json` を編集して、操作したいリポジトリを登録:
+
 ```json
 {
+  "$schema": "./config.schema.json",
   "allowedChannels": [],
+  "allowedUsers": [],
   "repos": {
     "my-project": "/Users/your-name/works/my-project",
-    "another-repo": "/Users/your-name/works/another-repo"
+    "another-repo": "~/works/another-repo"
   },
   "maxTurns": 10,
   "timeoutMs": 600000,
-  "allowedTools": ["Read", "Bash", "Edit", "Write", "Glob", "Grep"]
+  "allowedTools": ["Read", "Bash", "Edit", "Write", "Glob", "Grep"],
+  "skipPermissions": true
 }
 ```
 
-- `allowedChannels`: 空配列なら全チャンネル許可。制限する場合はチャンネルIDを指定
-- `repos`: `名前: パス` の形式でリポジトリを登録
-- `maxTurns`: Claude Codeの最大ターン数
-- `timeoutMs`: タイムアウト（ミリ秒）
-- `allowedTools`: 許可するツール
+| キー              | 説明                                                                                             |
+| ----------------- | ------------------------------------------------------------------------------------------------ |
+| `allowedChannels` | 空配列なら全チャンネル許可。制限する場合はチャンネルIDを指定                                     |
+| `allowedUsers`    | 空配列なら全ユーザー許可。制限する場合はSlackユーザーIDを指定                                    |
+| `repos`           | `名前: パス` の形式でリポジトリを登録（`~` はホームに展開されます）                              |
+| `maxTurns`        | Claude Codeの最大ターン数                                                                        |
+| `timeoutMs`       | タイムアウト（ミリ秒）                                                                           |
+| `allowedTools`    | `skipPermissions` が `false` のとき Claude に渡す許可ツール一覧                                  |
+| `skipPermissions` | `true` で `--dangerously-skip-permissions`（全ツール許可）。`false` で `allowedTools` のみに制限 |
+
+> `config.json` は `.gitignore` 済みでローカル専用です。編集の雛形と各項目のスキーマは
+> `config.json.example` / `config.schema.json` を参照してください（対応エディタでは
+> `$schema` により入力補完・検証が効きます）。
+
+必須項目やJSONに不備がある場合は、起動時に分かりやすいメッセージを表示して終了します。
 
 ### 8. Botをチャンネルに招待
 
 Slackで使いたいチャンネルを開き:
+
 ```
 /invite @Claude Code Bot
 ```
@@ -164,13 +186,28 @@ Slackチャンネルで **ボットをメンション** してメッセージを
 
 ### コマンド一覧
 
-| コマンド | 説明 |
-|---|---|
-| `@bot repo:リポジトリ名 タスク` | 新規セッション開始 |
-| `@bot メッセージ`（スレッド内） | 同じセッションで継続 |
-| `@bot repos` / `@bot list` | 設定済みリポジトリ一覧を表示 |
-| `@bot reset` | スレッドのセッションをリセット |
-| `@bot help` | ヘルプを表示 |
+| コマンド                        | 説明                           |
+| ------------------------------- | ------------------------------ |
+| `@bot repo:リポジトリ名 タスク` | 新規セッション開始             |
+| `@bot メッセージ`（スレッド内） | 同じセッションで継続           |
+| `@bot repos` / `@bot list`      | 設定済みリポジトリ一覧を表示   |
+| `@bot reset`                    | スレッドのセッションをリセット |
+| `@bot help`                     | ヘルプを表示                   |
+
+## 開発
+
+```bash
+npm run typecheck   # 型チェック
+npm run lint        # ESLint
+npm run format      # Prettier で整形（format:check で確認のみ）
+npm test            # Vitest でユニットテスト
+```
+
+- `src/utils.ts`（`parseMessage` / `splitMessage` / `expandPath`）と `src/config.ts`
+  （設定検証・アクセス制御）のロジックは `test/` に単体テストがあります。
+- `scripts/manual-claude-test.ts` は `claude` CLI 連携を手動確認するためのスクリプトです。
+- GitHub Actions（`.github/workflows/ci.yml`）で Node 18/20/22 に対して
+  フォーマット・Lint・型チェック・テストを自動実行します。
 
 ## トラブルシューティング
 
@@ -190,3 +227,12 @@ Slackチャンネルで **ボットをメンション** してメッセージを
 ### タイムアウトする
 
 `config.json` の `timeoutMs` を増やす（デフォルト: 10分）
+
+### 起動直後にエラーで落ちる
+
+`SLACK_BOT_TOKEN` / `SLACK_APP_TOKEN` の未設定、または `config.json` の記述ミスの可能性があります。
+起動ログのエラーメッセージ（どの環境変数・設定項目が問題か）を確認してください。
+
+## ライセンス
+
+[MIT](./LICENSE)

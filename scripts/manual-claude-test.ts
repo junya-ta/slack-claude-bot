@@ -1,17 +1,23 @@
 import { spawn } from 'child_process';
 
-
-const proc = spawn('claude', [
-  '-p', 'hello',
-  '--output-format', 'stream-json',
-  '--verbose',
-  '--dangerously-skip-permissions',
-  '--max-turns', '1',
-], {
-  cwd: process.cwd(),
-  env: process.env,
-  stdio: ['inherit', 'pipe', 'pipe'],
-});
+const proc = spawn(
+  'claude',
+  [
+    '-p',
+    'hello',
+    '--output-format',
+    'stream-json',
+    '--verbose',
+    '--dangerously-skip-permissions',
+    '--max-turns',
+    '1',
+  ],
+  {
+    cwd: process.cwd(),
+    env: process.env,
+    stdio: ['inherit', 'pipe', 'pipe'],
+  }
+);
 
 console.log('PID:', proc.pid);
 
