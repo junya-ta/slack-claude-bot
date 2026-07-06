@@ -114,7 +114,6 @@ export async function runClaude(options: RunClaudeOptions): Promise<ClaudeResult
     let lastResult = '';
     let sessionId = '';
     let buffer = '';
-    let turnCount = 0;
     let settled = false;
 
     const finish = (result: ClaudeResult) => {
@@ -135,9 +134,8 @@ export async function runClaude(options: RunClaudeOptions): Promise<ClaudeResult
           if (block.type === 'text' && block.text) {
             textParts.push(block.text);
           } else if (block.type === 'tool_use') {
-            turnCount++;
             const toolName = block.name || 'unknown';
-            const status = `[${turnCount}/${config.maxTurns}] ${toolName}${toolDetail(toolName, block.input)}`;
+            const status = `${toolName}${toolDetail(toolName, block.input)}`;
             logger.debug(`[Claude] ${status}`);
             onProgress?.(status);
           }
