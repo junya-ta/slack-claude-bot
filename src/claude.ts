@@ -137,7 +137,7 @@ export async function runClaude(options: RunClaudeOptions): Promise<ClaudeResult
           } else if (block.type === 'tool_use') {
             turnCount++;
             const toolName = block.name || 'unknown';
-            const status = `[${turnCount}/${config.maxTurns}] ${toolName}${toolDetail(toolName, block.input)}`;
+            const status = `[${turnCount}] ${toolName}${toolDetail(toolName, block.input)}`;
             logger.debug(`[Claude] ${status}`);
             onProgress?.(status);
           }
