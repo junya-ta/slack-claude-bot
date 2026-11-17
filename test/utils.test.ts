@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { homedir } from 'os';
 import { join } from 'path';
-import { expandPath, parseMessage, splitMessage } from '../src/utils.js';
+import { expandPath, parseMessage, splitMessage, formatResumeCommand } from '../src/utils.js';
 
 describe('expandPath', () => {
   it('展開: ~ をホームに', () => {
@@ -89,5 +89,18 @@ describe('splitMessage', () => {
     }
     // 中間チャンクは言語付きフェンスで開き直している
     expect(chunks[1].startsWith('```ts')).toBe(true);
+  });
+});
+
+describe('formatResumeCommand', () => {
+  it('通常のパスはそのまま使う', () => {
+    expect(formatResumeCommand('/Users/x/works/ob-ops-base', 'abc-123')).toBe(
+      'cd /Users/x/works/ob-ops-base && claude --resume abc-123'
+    );
+  });
+  it('空白やクォートを含むパスはシングルクォートで囲む', () => {
+    expect(formatResumeCommand("/Users/x/my repo's", 'id')).toBe(
+      "cd '/Users/x/my repo'\\''s' && claude --resume id"
+    );
   });
 });

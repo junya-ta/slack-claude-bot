@@ -12,7 +12,7 @@ import {
   isUserAllowed,
   type Config,
 } from './config.js';
-import { parseMessage, splitMessage } from './utils.js';
+import { parseMessage, splitMessage, formatResumeCommand } from './utils.js';
 import {
   shouldHandleDmMessage,
   isDmChannel,
@@ -194,6 +194,7 @@ const HELP_TEXT = [
   '• `repo:リポジトリ名 タスク` - リポジトリを明示して開始（省略時は既定リポジトリ）',
   '• `repos` / `list` - リポジトリ一覧を表示',
   '• `reset` - スレッドのセッションをリセット',
+  '• `pc` - このスレッドの会話をPCのターミナルで続けるコマンドを表示',
   '• `help` - このヘルプを表示',
   '• 処理中に送ったメッセージはキューに積まれ、前の処理が終わり次第順に実行されます',
   '',
@@ -230,6 +231,19 @@ async function handleText(job: Job): Promise<void> {
 
   if (text === 'help') {
     await say({ text: HELP_TEXT, thread_ts: threadKey });
+    return;
+  }
+
+  if (text === 'pc' || text === 'resume') {
+    const ctx = loadThreadContext(threadKey);
+    if (ctx?.sessionId) {
+      await say({
+        text: `PCで続けるには:\n\`\`\`\n${formatResumeCommand(ctx.repoPath, ctx.sessionId)}\n\`\`\``,
+        thread_ts: threadKey,
+      });
+    } else {
+      await say({ text: 'このスレッドにはまだセッションがありません。', thread_ts: threadKey });
+    }
     return;
   }
 
@@ -384,8 +398,11 @@ async function executeJob(job: Job): Promise<void> {
       }
 
       if (!resumeSessionId) {
+        const resumeHint = savedSessionId
+          ? `\nPCで続けるには:\n\`\`\`\n${formatResumeCommand(currentRepoPath, savedSessionId)}\n\`\`\``
+          : '';
         await say({
-          text: `_スレッド内で継続可能 | repo: ${currentRepoName}${savedSessionId ? ` | session: ${savedSessionId.slice(0, 12)}...` : ''}_`,
+          text: `_スレッドに返信で継続 | repo: ${currentRepoName}_${resumeHint}`,
           thread_ts: threadKey,
         });
       }

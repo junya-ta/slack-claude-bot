@@ -100,3 +100,12 @@ function detectOpenFence(text: string): string | null {
   }
   return openLang;
 }
+
+/**
+ * PCのターミナルで同じセッションを再開するためのコマンドを組み立てる。
+ * パスに空白や記号が含まれる場合はシングルクォートで囲む。
+ */
+export function formatResumeCommand(repoPath: string, sessionId: string): string {
+  const quoted = /^[A-Za-z0-9_./~-]+$/.test(repoPath) ? repoPath : `'${repoPath.replace(/'/g, `'\\''`)}'`;
+  return `cd ${quoted} && claude --resume ${sessionId}`;
+}
