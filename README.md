@@ -170,6 +170,20 @@ npm run dev
 npm run start
 ```
 
+### 10. 常駐させる（macOS / launchd・任意）
+
+ログイン時に自動起動し、落ちても自動で再起動させる。実行中は `caffeinate` でアイドルスリープを防ぐ（ノートMacで蓋を閉じた場合のスリープは防げない）。
+
+```bash
+./scripts/launchd.sh install    # 登録・起動
+./scripts/launchd.sh status     # 状態の確認
+./scripts/launchd.sh restart    # config.json を変えたあと
+./scripts/launchd.sh logs       # ~/Library/Logs/slack-claude-bot.log を追う
+./scripts/launchd.sh uninstall  # 停止・登録解除
+```
+
+`npm start` で手動起動した分と同時に動かさないこと（二重に応答する）。
+
 ## 使い方
 
 Slackチャンネルで **ボットをメンション** してメッセージを送信:
@@ -246,6 +260,11 @@ npm test            # Vitest でユニットテスト
 
 `SLACK_BOT_TOKEN` / `SLACK_APP_TOKEN` の未設定、または `config.json` の記述ミスの可能性があります。
 起動ログのエラーメッセージ（どの環境変数・設定項目が問題か）を確認してください。
+
+### 「Failed to authenticate: OAuth session expired」で失敗する
+
+- Claude Code CLI のログインが切れている。ターミナルで `claude auth login` を実行する
+- Claude Code（デスクトップアプリ等）のセッション内から `npm start` した場合、親の環境変数を継承して同じエラーになることがあった。子プロセスへは親の `CLAUDE_CODE_*` 等を渡さないようにしてあるが、常駐させるなら launchd 経由で起動するのが確実
 
 ## ライセンス
 
