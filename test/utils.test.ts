@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { homedir } from 'os';
 import { join } from 'path';
-import { expandPath, parseMessage, splitMessage, formatResumeCommand } from '../src/utils.js';
+import { expandPath, parseMessage, splitMessage, formatResumeCommand, toSlackMrkdwn } from '../src/utils.js';
 
 describe('expandPath', () => {
   it('展開: ~ をホームに', () => {
@@ -102,5 +102,21 @@ describe('formatResumeCommand', () => {
     expect(formatResumeCommand("/Users/x/my repo's", 'id')).toBe(
       "cd '/Users/x/my repo'\\''s' && claude --resume id"
     );
+  });
+});
+
+describe('toSlackMrkdwn', () => {
+  it('太字・見出し・リンクをSlack記法にする', () => {
+    expect(toSlackMrkdwn('**重要** です')).toBe('*重要* です');
+    expect(toSlackMrkdwn('## 決定事項')).toBe('*決定事項*');
+    expect(toSlackMrkdwn('## **太字の見出し**')).toBe('*太字の見出し*');
+    expect(toSlackMrkdwn('[公式](https://example.com/a)')).toBe('<https://example.com/a|公式>');
+  });
+  it('コードブロックとインラインコードの中は変換しない', () => {
+    const src = '`**x**` と\n```\n## not heading\n**y**\n```';
+    expect(toSlackMrkdwn(src)).toBe(src);
+  });
+  it('snake_case や __dunder__ は壊さない', () => {
+    expect(toSlackMrkdwn('go_to_market.md と __init__')).toBe('go_to_market.md と __init__');
   });
 });

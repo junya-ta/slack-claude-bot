@@ -12,7 +12,7 @@ import {
   isUserAllowed,
   type Config,
 } from './config.js';
-import { parseMessage, splitMessage, formatResumeCommand } from './utils.js';
+import { parseMessage, splitMessage, formatResumeCommand, toSlackMrkdwn } from './utils.js';
 import {
   shouldHandleDmMessage,
   isDmChannel,
@@ -363,13 +363,29 @@ async function executeJob(job: Job): Promise<void> {
       });
     };
 
+    // 途中のアシスタント発言もスレッドに残す（進捗メッセージは最後に消えるため）。投稿は直列化する
+    let postChain: Promise<unknown> = Promise.resolve();
+    let lastPosted = '';
+    const postAssistant = (msg: string) => {
+      const text = msg.trim();
+      if (!text || text === lastPosted) return;
+      lastPosted = text;
+      postChain = postChain.then(async () => {
+        for (const chunk of splitMessage(toSlackMrkdwn(text))) {
+          await say({ text: chunk, thread_ts: threadKey }).catch((err) =>
+            logger.error('[Slack] Failed to post assistant message:', err)
+          );
+        }
+      });
+    };
+
     try {
       const result = await runClaude({
         task: taskText,
         repoPath: currentRepoPath,
         config,
         onProgress: (status) => live.setProgress(status),
-        onAssistantMessage: (msg) => live.setAssistant(msg),
+        onAssistantMessage: postAssistant,
         resumeSessionId,
         onSessionId: persistSessionId,
         onSpawn: (proc) => {
@@ -379,6 +395,7 @@ async function executeJob(job: Job): Promise<void> {
       });
 
       await live.done();
+      await postChain;
 
       if (processingMsg.ts) {
         await client.chat.delete({ channel: channelId, ts: processingMsg.ts }).catch(() => {});
@@ -392,9 +409,14 @@ async function executeJob(job: Job): Promise<void> {
         return;
       }
 
-      const chunks = splitMessage(result.result || '(応答なし)');
-      for (const chunk of chunks) {
-        await say({ text: chunk, thread_ts: threadKey });
+      // 最終結果が途中で投稿済みの最後の発言と同じなら重複投稿しない
+      const finalText = (result.result || '').trim();
+      if (!finalText && !lastPosted) {
+        await say({ text: '(応答なし)', thread_ts: threadKey });
+      } else if (finalText && finalText !== lastPosted) {
+        for (const chunk of splitMessage(toSlackMrkdwn(finalText))) {
+          await say({ text: chunk, thread_ts: threadKey });
+        }
       }
 
       if (!resumeSessionId) {
@@ -408,6 +430,7 @@ async function executeJob(job: Job): Promise<void> {
       }
     } catch (err) {
       await live.done().catch(() => {});
+      await postChain.catch(() => {});
       await say({
         text: `:x: 予期しないエラー: ${err instanceof Error ? err.message : String(err)}`,
         thread_ts: threadKey,

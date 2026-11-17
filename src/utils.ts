@@ -109,3 +109,28 @@ export function formatResumeCommand(repoPath: string, sessionId: string): string
   const quoted = /^[A-Za-z0-9_./~-]+$/.test(repoPath) ? repoPath : `'${repoPath.replace(/'/g, `'\\''`)}'`;
   return `cd ${quoted} && claude --resume ${sessionId}`;
 }
+
+/**
+ * Claudeの出力（Markdown）をSlackのmrkdwnに寄せる。コードブロック・インラインコードの中は変換しない。
+ * - **太字** → *太字*
+ * - 見出し（# 〜 ######）→ *見出し*
+ * - [テキスト](URL) → <URL|テキスト>
+ */
+export function toSlackMrkdwn(text: string): string {
+  return text
+    .split(/(```[\s\S]*?```)/g)
+    .map((block, i) => {
+      if (i % 2 === 1) return block; // コードブロック
+      return block
+        .split(/(`[^`\n]+`)/g)
+        .map((part, j) => {
+          if (j % 2 === 1) return part; // インラインコード
+          return part
+            .replace(/\*\*(.+?)\*\*/g, '*$1*')
+            .replace(/^#{1,6}\s+(.+?)\s*#*$/gm, (_m, h: string) => `*${h.replace(/\*/g, '')}*`)
+            .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<$2|$1>');
+        })
+        .join('');
+    })
+    .join('');
+}
