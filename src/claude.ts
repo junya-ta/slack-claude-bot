@@ -67,6 +67,23 @@ function toolDetail(name: string, input: Record<string, unknown> | undefined): s
   return '';
 }
 
+/**
+ * 子プロセスの claude に渡す環境変数から、親の Claude Code（デスクトップアプリ等）由来の変数を除く。
+ * botを Claude Code のセッション内から起動すると、ホスト側の認証リフレッシュ前提の変数を継承し、
+ * 子の claude が "OAuth session expired" で失敗するため。ANTHROPIC_API_KEY など明示設定は残す。
+ */
+export function sanitizeChildEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const out: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (key === 'CLAUDECODE' || key === 'ANTHROPIC_BASE_URL') continue;
+    if (key.startsWith('CLAUDE_CODE_') || key.startsWith('CLAUDE_AGENT_SDK_')) continue;
+    if (key === 'CLAUDE_PID' || key === 'CLAUDE_EFFORT' || key === 'CLAUDE_PREVIEW_CLASSIFIER_FLOOR')
+      continue;
+    out[key] = value;
+  }
+  return out;
+}
+
 export async function runClaude(options: RunClaudeOptions): Promise<ClaudeResult> {
   const { task, repoPath, config, onProgress, onAssistantMessage, resumeSessionId, onSpawn, onSessionId } =
     options;
@@ -103,7 +120,7 @@ export async function runClaude(options: RunClaudeOptions): Promise<ClaudeResult
     try {
       proc = spawn('claude', args, {
         cwd,
-        env: process.env,
+        env: sanitizeChildEnv(process.env),
         stdio: ['ignore', 'pipe', 'pipe'],
       });
     } catch (err) {
