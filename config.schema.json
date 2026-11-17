@@ -19,7 +19,7 @@
       "type": "array",
       "items": { "type": "string" },
       "default": [],
-      "description": "ボットの利用を許可するSlackユーザーIDの配列。空配列なら全ユーザーが利用可能です。"
+      "description": "ボットの利用を許可するSlackユーザーIDの配列。チャンネルでは空配列なら全ユーザーが利用可能ですが、DMでは空だと誰も実行できません（DMで初回に返るIDを追加）。"
     },
     "repos": {
       "type": "object",
@@ -27,16 +27,21 @@
       "additionalProperties": { "type": "string", "minLength": 1 },
       "minProperties": 1
     },
+    "defaultRepo": {
+      "type": "string",
+      "minLength": 1,
+      "description": "新しい会話で `repo:` 指定が無いときに使うリポジトリ名（reposのキー）。省略時、reposが1件ならその1件を使います。"
+    },
     "maxTurns": {
       "type": "number",
       "exclusiveMinimum": 0,
-      "default": 10,
+      "default": 50,
       "description": "Claude Code の最大ターン数。"
     },
     "timeoutMs": {
       "type": "number",
       "exclusiveMinimum": 0,
-      "default": 600000,
+      "default": 1800000,
       "description": "Claude Code 実行のタイムアウト（ミリ秒）。"
     },
     "allowedTools": {

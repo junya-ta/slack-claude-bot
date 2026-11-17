@@ -6,8 +6,9 @@
     "example": "/Users/your-name/works/example-repo",
     "another-repo": "~/works/another-repo"
   },
-  "maxTurns": 10,
-  "timeoutMs": 600000,
+  "defaultRepo": "example",
+  "maxTurns": 50,
+  "timeoutMs": 1800000,
   "allowedTools": ["Read", "Bash", "Edit", "Write", "Glob", "Grep"],
   "skipPermissions": true
 }

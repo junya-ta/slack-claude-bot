@@ -6,12 +6,15 @@ SlackからClaude Code CLIを呼び出し、ローカルリポジトリに対し
 
 ## 特徴
 
-- **メンション駆動** — `@bot` 付きメッセージにのみ反応。通常の会話を邪魔しない
+- **DMで使える** — botとのDMにメンション不要でメッセージを送るだけ。通常メッセージで新規会話、そのスレッドへの返信で継続（`allowedUsers` 設定が必須）
+- **メンション駆動（チャンネル）** — チャンネルでは `@bot` 付きメッセージにのみ反応。通常の会話を邪魔しない
+- **既定リポジトリ** — `defaultRepo`（または repos が1件のみ）なら `repo:` 指定を省略可能
+- **処理中メッセージのキュー** — 同一スレッドが処理中でもメッセージは破棄されず、順番に同じセッションで実行
 - **マルチリポジトリ対応** — `config.json` に複数のリポジトリを登録し、メッセージで切り替え可能
 - **スレッドでセッション継続** — 同一スレッド内のやり取りは同じClaude Codeセッションとして継続。文脈を保ったまま追加指示が可能
 - **リアルタイム進捗表示** — Claude Codeのツール実行状況（ファイル読み込み、Grep、編集など）をSlack上にリアルタイムで表示。進捗とメッセージ更新は直列化・スロットルされ、表示崩れやレート制限を回避
 - **アクセス制限** — 許可されたチャンネル／ユーザーでのみ動作するよう制御可能
-- **同時実行の抑制** — 同一スレッドでの並行実行をロックで防止し、セッションの競合を回避
+- **同時実行の抑制** — 同一スレッドでの並行実行をロックで防止し、セッションの競合を回避（後続はキューで順次実行）
 - **安全な終了** — `SIGINT`/`SIGTERM` で実行中のClaudeプロセスを片付けてから終了
 
 ## アーキテクチャ
@@ -65,6 +68,7 @@ Slack ──(Socket Mode)──▶ Node.js (Bolt) ──(子プロセス)──�
 2. 「Bot Token Scopes」セクションで以下を追加:
    - `app_mentions:read` - メンションの読み取り
    - `chat:write` - メッセージ送信
+   - DM利用時: `im:history`（DMの読み取り）、必要なら `im:read`
 
 ### 4. Event Subscriptions設定
 
@@ -72,7 +76,15 @@ Slack ──(Socket Mode)──▶ Node.js (Bolt) ──(子プロセス)──�
 2. 「Enable Events」をONに
 3. 「Subscribe to bot events」で以下を追加:
    - `app_mention`
+   - DM利用時: `message.im`
 4. 「Save Changes」をクリック
+
+### 4.5. DM利用の設定（任意）
+
+1. 左メニュー「App Home」→「Show Tabs」で「Messages Tab」をON
+2. 「Allow users to send Slash commands and messages from the messages tab」をON
+3. 上記の `im:history`（必要なら `im:read`）と `message.im` を追加後、アプリを**再インストール**
+4. `config.json` の `allowedUsers` を設定する。DMでは `allowedUsers` が空だと誰も実行できません。空のままbotにDMを送ると「allowedUsers に次のIDを追加してください: `U...`」と返るので、そのIDを `allowedUsers` に追加して再起動します
 
 ### 5. Appインストール
 
@@ -115,8 +127,9 @@ cp config.json.example config.json
     "my-project": "/Users/your-name/works/my-project",
     "another-repo": "~/works/another-repo"
   },
-  "maxTurns": 10,
-  "timeoutMs": 600000,
+  "defaultRepo": "my-project",
+  "maxTurns": 50,
+  "timeoutMs": 1800000,
   "allowedTools": ["Read", "Bash", "Edit", "Write", "Glob", "Grep"],
   "skipPermissions": true
 }
@@ -125,7 +138,8 @@ cp config.json.example config.json
 | キー              | 説明                                                                                             |
 | ----------------- | ------------------------------------------------------------------------------------------------ |
 | `allowedChannels` | 空配列なら全チャンネル許可。制限する場合はチャンネルIDを指定                                     |
-| `allowedUsers`    | 空配列なら全ユーザー許可。制限する場合はSlackユーザーIDを指定                                    |
+| `allowedUsers`    | チャンネルでは空配列なら全ユーザー許可。**DMでは空だと誰も実行不可**（SlackユーザーIDを指定）    |
+| `defaultRepo`     | 任意。`repo:` 省略時に使う `repos` のキー。省略時は repos が1件ならその1件                       |
 | `repos`           | `名前: パス` の形式でリポジトリを登録（`~` はホームに展開されます）                              |
 | `maxTurns`        | Claude Codeの最大ターン数                                                                        |
 | `timeoutMs`       | タイムアウト（ミリ秒）                                                                           |

@@ -43,6 +43,8 @@ export interface RunClaudeOptions {
   onProgress?: ProgressCallback;
   onAssistantMessage?: AssistantMessageCallback;
   resumeSessionId?: string;
+  /** stream で session_id を最初に取得した時点で呼ばれる（失敗時にも会話を続けられるよう即保存する用） */
+  onSessionId?: (id: string) => void;
   /** 起動された子プロセスを受け取るコールバック（graceful shutdown 用） */
   onSpawn?: (proc: ChildProcess) => void;
 }
@@ -66,7 +68,8 @@ function toolDetail(name: string, input: Record<string, unknown> | undefined): s
 }
 
 export async function runClaude(options: RunClaudeOptions): Promise<ClaudeResult> {
-  const { task, repoPath, config, onProgress, onAssistantMessage, resumeSessionId, onSpawn } = options;
+  const { task, repoPath, config, onProgress, onAssistantMessage, resumeSessionId, onSpawn, onSessionId } =
+    options;
 
   return new Promise((resolve) => {
     const args = [
@@ -127,6 +130,11 @@ export async function runClaude(options: RunClaudeOptions): Promise<ClaudeResult
       if (event.session_id && !sessionId) {
         sessionId = event.session_id;
         logger.debug(`[Claude] session_id captured: ${sessionId}`);
+        try {
+          onSessionId?.(sessionId);
+        } catch (err) {
+          logger.error('[Claude] onSessionId callback failed:', err);
+        }
       }
 
       if (event.type === 'assistant' && event.message?.content) {

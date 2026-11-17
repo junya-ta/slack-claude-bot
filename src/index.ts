@@ -13,6 +13,14 @@ import {
   type Config,
 } from './config.js';
 import { parseMessage, splitMessage } from './utils.js';
+import {
+  shouldHandleDmMessage,
+  isDmChannel,
+  stripMentions,
+  checkDmUser,
+  resolveDefaultRepoName,
+  type IncomingMessageEvent,
+} from './routing.js';
 import { runClaude } from './claude.js';
 import { logger } from './logger.js';
 
@@ -179,10 +187,232 @@ function createLiveStatus(client: App['client'], channelId: string, ts: string |
   };
 }
 
+const HELP_TEXT = [
+  '*使い方（DM）:*',
+  '• botとのDMに普通にメッセージを送る（メンション不要）→ 新しい会話を開始して実行',
+  '• そのメッセージのスレッドに返信 → 同じセッションで継続',
+  '• `repo:リポジトリ名 タスク` - リポジトリを明示して開始（省略時は既定リポジトリ）',
+  '• `repos` / `list` - リポジトリ一覧を表示',
+  '• `reset` - スレッドのセッションをリセット',
+  '• `help` - このヘルプを表示',
+  '• 処理中に送ったメッセージはキューに積まれ、前の処理が終わり次第順に実行されます',
+  '',
+  '*チャンネルで使う場合:* `@bot メッセージ` のようにメンションします（`repo:` 指定は同様）。',
+].join('\n');
+
+type SayFn = (msg: { text: string; thread_ts?: string }) => Promise<{ ts?: string }>;
+
+interface Job {
+  text: string;
+  channelId: string;
+  threadKey: string;
+  say: SayFn;
+  client: App['client'];
+}
+
+// スレッドごとのFIFOキュー（メモリのみ。再起動で消える）
+const threadQueues = new Map<string, Job[]>();
+let shuttingDown = false;
+
+/**
+ * DM・チャンネル共通のメッセージ処理。認可チェックは呼び出し側で済ませておくこと。
+ */
+async function handleText(job: Job): Promise<void> {
+  const { text, threadKey, say } = job;
+
+  if (text === 'repos' || text === 'list') {
+    const repoList = Object.entries(config.repos)
+      .map(([name, path]) => `• \`${name}\` → ${path}${name === config.defaultRepo ? ' (既定)' : ''}`)
+      .join('\n');
+    await say({ text: `*設定済みリポジトリ一覧:*\n${repoList || '(なし)'}`, thread_ts: threadKey });
+    return;
+  }
+
+  if (text === 'help') {
+    await say({ text: HELP_TEXT, thread_ts: threadKey });
+    return;
+  }
+
+  if (text === 'reset') {
+    threadQueues.delete(threadKey);
+    if (deleteThreadContext(threadKey)) {
+      await say({
+        text: 'セッションをリセットしました。新しいメッセージ（または `repo:リポジトリ名 タスク`）で開始できます。',
+        thread_ts: threadKey,
+      });
+    } else {
+      await say({ text: 'このスレッドにはアクティブなセッションがありません。', thread_ts: threadKey });
+    }
+    return;
+  }
+
+  // 同一スレッドで処理中なら破棄せずキューに積む
+  if (busyThreads.has(threadKey)) {
+    const queue = threadQueues.get(threadKey) ?? [];
+    queue.push(job);
+    threadQueues.set(threadKey, queue);
+    await say({
+      text: `:inbox_tray: 前の処理が終わったら続けて実行します（待ち ${queue.length} 件）。`,
+      thread_ts: threadKey,
+    });
+    return;
+  }
+
+  busyThreads.add(threadKey);
+  try {
+    let next: Job | undefined = job;
+    while (next) {
+      await executeJob(next);
+      if (shuttingDown) break;
+      next = threadQueues.get(threadKey)?.shift();
+      if (!next) threadQueues.delete(threadKey);
+    }
+  } finally {
+    busyThreads.delete(threadKey);
+  }
+}
+
+/** 1件のタスクを実行する（例外は内部で処理し投げない）。busyThreads の管理は呼び出し側。 */
+async function executeJob(job: Job): Promise<void> {
+  const { text, channelId, threadKey, say, client } = job;
+  try {
+    // 実行直前に読み直す（キュー待ち中に前の実行でsessionIdが保存されている）
+    const existingContext = loadThreadContext(threadKey);
+    const { repoName, task } = parseMessage(text);
+    logger.debug(`[ParseMessage] repoName=${repoName ?? 'null'}, task="${task}"`);
+
+    let currentRepoName: string;
+    let currentRepoPath: string;
+    let resumeSessionId: string | undefined;
+
+    if (repoName) {
+      const repoPath = getRepoPath(config, repoName);
+      if (!repoPath) {
+        const availableRepos = Object.keys(config.repos).join(', ');
+        await say({
+          text: `リポジトリ \`${repoName}\` が見つかりません。\n利用可能: ${availableRepos || '(なし)'}`,
+          thread_ts: threadKey,
+        });
+        return;
+      }
+      currentRepoName = repoName;
+      currentRepoPath = repoPath;
+      if (!task) {
+        saveThreadContext(threadKey, { repoName: currentRepoName, repoPath: currentRepoPath, sessionId: '' });
+        await say({
+          text: `セッションを開始しました (repo: \`${currentRepoName}\`)。\nこのスレッドでタスクを送ってください。`,
+          thread_ts: threadKey,
+        });
+        return;
+      }
+    } else if (existingContext) {
+      currentRepoName = existingContext.repoName;
+      currentRepoPath = existingContext.repoPath;
+      resumeSessionId = existingContext.sessionId || undefined;
+    } else {
+      const defaultName = resolveDefaultRepoName(config);
+      const defaultPath = defaultName ? getRepoPath(config, defaultName) : null;
+      if (!defaultName || !defaultPath) {
+        await say({
+          text: '`repo:リポジトリ名` を指定してください。\n例: `repo:my-project このバグを修正して`',
+          thread_ts: threadKey,
+        });
+        return;
+      }
+      currentRepoName = defaultName;
+      currentRepoPath = defaultPath;
+    }
+
+    const taskText = repoName ? task : text;
+
+    // Claude起動前にrepoを保存（sessionIdは取得次第すぐ更新する）。失敗してもこのスレッドで続けられる
+    let savedSessionId = resumeSessionId ?? '';
+    saveThreadContext(threadKey, {
+      repoName: currentRepoName,
+      repoPath: currentRepoPath,
+      sessionId: savedSessionId,
+    });
+
+    const statusPrefix = resumeSessionId ? '(継続)' : '(新規)';
+    const header = `:hourglass_flowing_sand: ${statusPrefix} Claude Code を実行中... (repo: ${currentRepoName})`;
+
+    const processingMsg = await say({ text: `${header}\n_開始中..._`, thread_ts: threadKey });
+    const live = createLiveStatus(client, channelId, processingMsg.ts, header);
+
+    const persistSessionId = (id: string) => {
+      if (!id || id === savedSessionId) return;
+      savedSessionId = id;
+      saveThreadContext(threadKey, {
+        repoName: currentRepoName,
+        repoPath: currentRepoPath,
+        sessionId: id,
+      });
+    };
+
+    try {
+      const result = await runClaude({
+        task: taskText,
+        repoPath: currentRepoPath,
+        config,
+        onProgress: (status) => live.setProgress(status),
+        onAssistantMessage: (msg) => live.setAssistant(msg),
+        resumeSessionId,
+        onSessionId: persistSessionId,
+        onSpawn: (proc) => {
+          runningProcs.add(proc);
+          proc.on('close', () => runningProcs.delete(proc));
+        },
+      });
+
+      await live.done();
+
+      if (processingMsg.ts) {
+        await client.chat.delete({ channel: channelId, ts: processingMsg.ts }).catch(() => {});
+      }
+
+      // resume時に別のsession IDが返ってきたら新しい方で上書き
+      if (result.sessionId) persistSessionId(result.sessionId);
+
+      if (!result.success) {
+        await say({ text: `:x: エラー\n\`\`\`\n${result.error}\n\`\`\``, thread_ts: threadKey });
+        return;
+      }
+
+      const chunks = splitMessage(result.result || '(応答なし)');
+      for (const chunk of chunks) {
+        await say({ text: chunk, thread_ts: threadKey });
+      }
+
+      if (!resumeSessionId) {
+        await say({
+          text: `_スレッド内で継続可能 | repo: ${currentRepoName}${savedSessionId ? ` | session: ${savedSessionId.slice(0, 12)}...` : ''}_`,
+          thread_ts: threadKey,
+        });
+      }
+    } catch (err) {
+      await live.done().catch(() => {});
+      await say({
+        text: `:x: 予期しないエラー: ${err instanceof Error ? err.message : String(err)}`,
+        thread_ts: threadKey,
+      });
+    }
+  } catch (err) {
+    logger.error(`[Job] Unexpected failure in thread ${threadKey}:`, err);
+    await say({
+      text: `:x: 予期しないエラー: ${err instanceof Error ? err.message : String(err)}`,
+      thread_ts: threadKey,
+    }).catch(() => {});
+  }
+}
+
+// チャンネルでのメンション（互換）
 app.event('app_mention', async ({ event, say, client }) => {
   if (!event.text) return;
 
   const channelId = event.channel;
+  // DM内のメンションは message イベント側で処理する（二重実行防止）
+  if (isDmChannel(channelId, (event as { channel_type?: string }).channel_type)) return;
+
   const threadKey = event.thread_ts || event.ts;
   const userId = event.user;
 
@@ -197,165 +427,37 @@ app.event('app_mention', async ({ event, say, client }) => {
     return;
   }
 
-  const text = event.text.replace(/<@[A-Z0-9]+>/g, '').trim();
+  await handleText({ text: stripMentions(event.text), channelId, threadKey, say, client });
+});
 
-  if (text === 'repos' || text === 'list') {
-    const repoList = Object.entries(config.repos)
-      .map(([name, path]) => `• \`${name}\` → ${path}`)
-      .join('\n');
-    await say({ text: `*設定済みリポジトリ一覧:*\n${repoList || '(なし)'}`, thread_ts: threadKey });
-    return;
-  }
+// botとのDM（メンション不要）
+app.event('message', async ({ event, say, client }) => {
+  const ev = event as unknown as IncomingMessageEvent & { channel: string; ts: string; thread_ts?: string };
+  if (!shouldHandleDmMessage(ev, botUserId)) return;
 
-  if (text === 'help') {
-    const mention = botUserId ? `<@${botUserId}>` : '@bot';
+  const threadKey = ev.thread_ts || ev.ts;
+  const userId = ev.user as string;
+
+  const auth = checkDmUser(config, userId);
+  if (auth === 'unconfigured') {
     await say({
-      text: [
-        '*使い方:*',
-        `• \`${mention} repo:リポジトリ名\` - セッション開始（タスクは後からでも可）`,
-        `• \`${mention} repo:リポジトリ名 タスク\` - セッション開始＋即実行`,
-        `• スレッド内で \`${mention} メッセージ\` → 同じセッションで継続`,
-        `• \`${mention} repos\` または \`${mention} list\` - リポジトリ一覧を表示`,
-        `• \`${mention} reset\` - スレッドのセッションをリセット`,
-        `• \`${mention} help\` - このヘルプを表示`,
-        '',
-        '*例:*',
-        `\`${mention} repo:my-project このバグを修正して\``,
-        `(スレッド内で) \`${mention} 他にも似たバグがないか探して\``,
-        '',
-        '_※ このボットはメンション付きメッセージにのみ反応します_',
-      ].join('\n'),
+      text: `DMを使うには config.json の allowedUsers に次のIDを追加してください: \`${userId}\``,
       thread_ts: threadKey,
     });
     return;
   }
-
-  if (text === 'reset') {
-    if (deleteThreadContext(threadKey)) {
-      await say({
-        text: 'セッションをリセットしました。`repo:リポジトリ名` で新しいセッションを開始してください。',
-        thread_ts: threadKey,
-      });
-    } else {
-      await say({ text: 'このスレッドにはアクティブなセッションがありません。', thread_ts: threadKey });
-    }
+  if (auth === 'denied') {
+    logger.debug(`[Skip] DM user ${userId} is not allowed`);
+    await say({ text: 'このボットを使用する権限がありません。', thread_ts: threadKey });
     return;
   }
 
-  // 同一スレッドで既に処理中なら並行実行を避ける
-  if (busyThreads.has(threadKey)) {
-    await say({
-      text: ':warning: このスレッドは現在処理中です。完了までお待ちください。',
-      thread_ts: threadKey,
-    });
-    return;
-  }
-
-  const existingContext = loadThreadContext(threadKey);
-  const { repoName, task } = parseMessage(text);
-  logger.debug(`[ParseMessage] repoName=${repoName ?? 'null'}, task="${task}"`);
-
-  let currentRepoName: string;
-  let currentRepoPath: string;
-  let resumeSessionId: string | undefined;
-
-  if (repoName) {
-    const repoPath = getRepoPath(config, repoName);
-    if (!repoPath) {
-      const availableRepos = Object.keys(config.repos).join(', ');
-      await say({
-        text: `リポジトリ \`${repoName}\` が見つかりません。\n利用可能: ${availableRepos || '(なし)'}`,
-        thread_ts: threadKey,
-      });
-      return;
-    }
-    currentRepoName = repoName;
-    currentRepoPath = repoPath;
-    if (!task) {
-      saveThreadContext(threadKey, { repoName: currentRepoName, repoPath: currentRepoPath, sessionId: '' });
-      await say({
-        text: `セッションを開始しました (repo: \`${currentRepoName}\`)。\nこのスレッドでメンションしてタスクを送ってください。`,
-        thread_ts: threadKey,
-      });
-      return;
-    }
-  } else if (existingContext) {
-    currentRepoName = existingContext.repoName;
-    currentRepoPath = existingContext.repoPath;
-    resumeSessionId = existingContext.sessionId || undefined;
-  } else {
-    await say({
-      text: '`repo:リポジトリ名` を指定してください。\n例: `repo:my-project このバグを修正して`',
-      thread_ts: threadKey,
-    });
-    return;
-  }
-
-  const taskText = repoName ? task : text;
-
-  busyThreads.add(threadKey);
-  const statusPrefix = resumeSessionId ? '(継続)' : '(新規)';
-  const header = `:hourglass_flowing_sand: ${statusPrefix} Claude Code を実行中... (repo: ${currentRepoName})`;
-
-  const processingMsg = await say({ text: `${header}\n_開始中..._`, thread_ts: threadKey });
-  const live = createLiveStatus(client, channelId, processingMsg.ts, header);
-
-  try {
-    const result = await runClaude({
-      task: taskText,
-      repoPath: currentRepoPath,
-      config,
-      onProgress: (status) => live.setProgress(status),
-      onAssistantMessage: (msg) => live.setAssistant(msg),
-      resumeSessionId,
-      onSpawn: (proc) => {
-        runningProcs.add(proc);
-        proc.on('close', () => runningProcs.delete(proc));
-      },
-    });
-
-    await live.done();
-
-    if (processingMsg.ts) {
-      await client.chat.delete({ channel: channelId, ts: processingMsg.ts }).catch(() => {});
-    }
-
-    if (!result.success) {
-      await say({ text: `:x: エラー\n\`\`\`\n${result.error}\n\`\`\``, thread_ts: threadKey });
-      return;
-    }
-
-    const sessionId = result.sessionId || '';
-    saveThreadContext(threadKey, {
-      repoName: currentRepoName,
-      repoPath: currentRepoPath,
-      sessionId,
-    });
-
-    const chunks = splitMessage(result.result || '(応答なし)');
-    for (const chunk of chunks) {
-      await say({ text: chunk, thread_ts: threadKey });
-    }
-
-    if (!resumeSessionId) {
-      await say({
-        text: `_スレッド内で継続可能 | repo: ${currentRepoName}${sessionId ? ` | session: ${sessionId.slice(0, 12)}...` : ''}_`,
-        thread_ts: threadKey,
-      });
-    }
-  } catch (err) {
-    await live.done().catch(() => {});
-    await say({
-      text: `:x: 予期しないエラー: ${err instanceof Error ? err.message : String(err)}`,
-      thread_ts: threadKey,
-    });
-  } finally {
-    busyThreads.delete(threadKey);
-  }
+  const text = stripMentions(ev.text as string);
+  if (!text) return;
+  await handleText({ text, channelId: ev.channel, threadKey, say: say as SayFn, client });
 });
 
 let cleanupTimer: NodeJS.Timeout | undefined;
-let shuttingDown = false;
 
 async function shutdown(signal: string): Promise<void> {
   if (shuttingDown) return;
@@ -397,5 +499,7 @@ process.on('SIGTERM', () => void shutdown('SIGTERM'));
   logger.info(
     `Allowed channels: ${config.allowedChannels.length > 0 ? config.allowedChannels.join(', ') : '(all)'}`
   );
-  logger.info(`Allowed users: ${config.allowedUsers.length > 0 ? config.allowedUsers.join(', ') : '(all)'}`);
+  logger.info(
+    `Allowed users: ${config.allowedUsers.length > 0 ? config.allowedUsers.join(', ') : '(none: チャンネルは全員許可 / DMは無効)'}`
+  );
 })();

@@ -13,8 +13,8 @@ const baseRaw = { repos: { app: '/path/app' } };
 describe('validateConfig', () => {
   it('最小構成でデフォルト値を補完する', () => {
     const cfg = validateConfig(baseRaw);
-    expect(cfg.maxTurns).toBe(10);
-    expect(cfg.timeoutMs).toBe(600_000);
+    expect(cfg.maxTurns).toBe(50);
+    expect(cfg.timeoutMs).toBe(1_800_000);
     expect(cfg.allowedChannels).toEqual([]);
     expect(cfg.allowedUsers).toEqual([]);
     expect(cfg.allowedTools).toContain('Read');
@@ -88,5 +88,21 @@ describe('access helpers', () => {
   it('allowedUsers 空なら全許可', () => {
     const open = validateConfig(baseRaw);
     expect(isUserAllowed(open, undefined)).toBe(true);
+  });
+});
+
+describe('defaultRepo', () => {
+  it('reposにあるキーなら受理する', () => {
+    expect(validateConfig({ ...baseRaw, defaultRepo: 'app' }).defaultRepo).toBe('app');
+  });
+  it('未指定ならundefined', () => {
+    expect(validateConfig(baseRaw).defaultRepo).toBeUndefined();
+  });
+  it('reposに無いキーは例外', () => {
+    expect(() => validateConfig({ ...baseRaw, defaultRepo: 'nope' })).toThrow(/defaultRepo/);
+  });
+  it('空文字・非文字列は例外', () => {
+    expect(() => validateConfig({ ...baseRaw, defaultRepo: '' })).toThrow(/defaultRepo/);
+    expect(() => validateConfig({ ...baseRaw, defaultRepo: 1 })).toThrow(/defaultRepo/);
   });
 });

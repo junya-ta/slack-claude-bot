@@ -9,17 +9,19 @@ export interface Config {
   allowedChannels: string[];
   allowedUsers: string[];
   repos: Record<string, string>;
+  /** 新しい会話で `repo:` 指定が無いときに使うリポジトリ名（reposのキー） */
+  defaultRepo?: string;
   maxTurns: number;
   timeoutMs: number;
   allowedTools: string[];
   skipPermissions: boolean;
 }
 
-const DEFAULT_CONFIG: Omit<Config, 'repos'> = {
+const DEFAULT_CONFIG: Omit<Config, 'repos' | 'defaultRepo'> = {
   allowedChannels: [],
   allowedUsers: [],
-  maxTurns: 10,
-  timeoutMs: 600_000,
+  maxTurns: 50,
+  timeoutMs: 1_800_000,
   allowedTools: ['Read', 'Bash', 'Edit', 'Write', 'Glob', 'Grep'],
   skipPermissions: true,
 };
@@ -66,10 +68,22 @@ export function validateConfig(raw: unknown): Config {
     }
   }
 
+  let defaultRepo: string | undefined;
+  if (obj.defaultRepo !== undefined) {
+    if (typeof obj.defaultRepo !== 'string' || obj.defaultRepo.length === 0) {
+      throw new Error('config.json の `defaultRepo` は空でない文字列である必要があります。');
+    }
+    if (!Object.prototype.hasOwnProperty.call(repos, obj.defaultRepo)) {
+      throw new Error(`config.json の \`defaultRepo\` ("${obj.defaultRepo}") が repos に存在しません。`);
+    }
+    defaultRepo = obj.defaultRepo;
+  }
+
   return {
     allowedChannels: asStringArray(obj.allowedChannels, 'allowedChannels', DEFAULT_CONFIG.allowedChannels),
     allowedUsers: asStringArray(obj.allowedUsers, 'allowedUsers', DEFAULT_CONFIG.allowedUsers),
     repos: Object.fromEntries(repoEntries as [string, string][]),
+    ...(defaultRepo !== undefined ? { defaultRepo } : {}),
     maxTurns: asPositiveInt(obj.maxTurns, 'maxTurns', DEFAULT_CONFIG.maxTurns),
     timeoutMs: asPositiveInt(obj.timeoutMs, 'timeoutMs', DEFAULT_CONFIG.timeoutMs),
     allowedTools: asStringArray(obj.allowedTools, 'allowedTools', DEFAULT_CONFIG.allowedTools),
