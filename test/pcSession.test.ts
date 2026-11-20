@@ -5,6 +5,7 @@ import {
   buildClaudeShellCommand,
   buildTmuxNewSessionArgs,
   extractRemoteUrl,
+  tmuxAttachCommand,
 } from '../src/pcSession.js';
 
 describe('pcSessionName', () => {
@@ -51,6 +52,8 @@ describe('buildTmuxNewSessionArgs', () => {
     expect(
       buildTmuxNewSessionArgs('scb-1-2', '/my repo', { sessionId: 'sid', skipPermissions: false })
     ).toEqual([
+      '-L',
+      'slack-claude-bot',
       'new-session',
       '-d',
       '-s',
@@ -74,5 +77,11 @@ describe('extractRemoteUrl', () => {
   });
   it('無ければ null', () => {
     expect(extractRemoteUrl('hello')).toBeNull();
+  });
+});
+
+describe('tmuxAttachCommand', () => {
+  it('bot専用ソケットを指定する', () => {
+    expect(tmuxAttachCommand('scb-1-2')).toBe('tmux -L slack-claude-bot attach -t scb-1-2');
   });
 });

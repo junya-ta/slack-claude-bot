@@ -29,6 +29,7 @@ import {
   waitForRemoteUrl,
   startPcSession,
   stopPcSession,
+  tmuxAttachCommand,
 } from './pcSession.js';
 import { logger } from './logger.js';
 
@@ -248,7 +249,7 @@ async function handlePc(job: Job): Promise<void> {
     if (await hasPcSession(name)) {
       const url = await captureRemoteUrl(name);
       await say({
-        text: `既に起動中です。${url ? `次のURLまたはデスクトップアプリのサイドバーから開けます: ${url}` : `URLを取得できませんでした。\`tmux attach -t ${name}\` で確認してください。`}\n${PC_NOTE}`,
+        text: `既に起動中です。${url ? `次のURLまたはデスクトップアプリのサイドバーから開けます: ${url}` : `URLを取得できませんでした。\`${tmuxAttachCommand(name)}\` で確認してください。`}\n${PC_NOTE}`,
         thread_ts: threadKey,
       });
       return;
@@ -266,7 +267,7 @@ async function handlePc(job: Job): Promise<void> {
       });
     } else {
       await say({
-        text: `起動はしましたがURLを取得できませんでした。\`tmux attach -t ${name}\` で確認してください。\n${PC_NOTE}`,
+        text: `起動はしましたがURLを取得できませんでした。\`${tmuxAttachCommand(name)}\` で確認してください。\n${PC_NOTE}`,
         thread_ts: threadKey,
       });
     }
@@ -305,6 +306,11 @@ async function handleText(job: Job): Promise<void> {
   }
 
   if (text === 'pc' || text === 'resume') {
+    // Slackからの実行中に対話セッションを重ねると、同じセッションに2か所から書き込むことになる
+    if (busyThreads.has(threadKey)) {
+      await say({ text: '実行中です。終わってから `pc` を送ってください。', thread_ts: threadKey });
+      return;
+    }
     await handlePc(job);
     return;
   }

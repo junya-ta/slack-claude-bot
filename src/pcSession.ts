@@ -6,7 +6,19 @@ import { logger } from './logger.js';
 const execFileAsync = promisify(execFile);
 
 const URL_POLL_ATTEMPTS = 20;
+
+/**
+ * bot専用のtmuxソケット名。ユーザが別の環境（Claude Codeのセッション内など）で起動したtmuxサーバの
+ * 環境変数を新しいセッションが引き継がないよう、サーバを分ける。
+ */
+export const TMUX_SOCKET = 'slack-claude-bot';
+const T = ['-L', TMUX_SOCKET];
 const URL_POLL_INTERVAL_MS = 1000;
+
+/** 手元のターミナルからセッションを覗くコマンド。 */
+export function tmuxAttachCommand(name: string): string {
+  return `tmux -L ${TMUX_SOCKET} attach -t ${name}`;
+}
 
 /** スレッドごとに一意なtmuxセッション名。tmuxの名前に使えない `.` `:` は `-` にする。 */
 export function pcSessionName(threadKey: string): string {
@@ -34,6 +46,7 @@ export function buildClaudeShellCommand({ sessionId, skipPermissions }: PcClaude
 /** `tmux new-session` の引数配列（execFile用）。 */
 export function buildTmuxNewSessionArgs(name: string, repoPath: string, opts: PcClaudeOptions): string[] {
   return [
+    ...T,
     'new-session',
     '-d',
     '-s',
@@ -57,7 +70,7 @@ export function extractRemoteUrl(text: string): string | null {
 /** tmuxセッションが存在するか。tmux未インストール・サーバ未起動は false。 */
 export async function hasPcSession(name: string): Promise<boolean> {
   try {
-    await execFileAsync('tmux', ['has-session', '-t', `=${name}`]);
+    await execFileAsync('tmux', [...T, 'has-session', '-t', `=${name}`]);
     return true;
   } catch {
     return false;
@@ -68,7 +81,7 @@ export async function hasPcSession(name: string): Promise<boolean> {
 export async function captureRemoteUrl(name: string): Promise<string | null> {
   try {
     // 折り返しでURLが分断されないよう -J で行結合
-    const { stdout } = await execFileAsync('tmux', ['capture-pane', '-p', '-J', '-t', `=${name}:`]);
+    const { stdout } = await execFileAsync('tmux', [...T, 'capture-pane', '-p', '-J', '-t', `=${name}:`]);
     return extractRemoteUrl(stdout);
   } catch {
     return null;
@@ -121,7 +134,7 @@ export function startPcSession(
 export async function stopPcSession(name: string): Promise<boolean> {
   if (!(await hasPcSession(name))) return false;
   try {
-    await execFileAsync('tmux', ['kill-session', '-t', `=${name}`]);
+    await execFileAsync('tmux', [...T, 'kill-session', '-t', `=${name}`]);
     return true;
   } catch (err) {
     logger.error(`[PcSession] kill-session failed for ${name}:`, err);

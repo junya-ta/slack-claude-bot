@@ -232,7 +232,7 @@ DMではメンション（`@bot`）は不要。新しい会話の最初の返信
 - **tmuxが必要**（`brew install tmux`）。tmuxが無い・起動に失敗した場合は、手動用のコマンドを返す。
 - 起動したセッションはbotを再起動しても残る。
 - 起動中はSlackからそのスレッドへの通常メッセージ・`reset` は実行されない（`pc stop` で閉じてから送る）。
-- 放置したセッションは `pc stop` か `tmux kill-session -t scb-...` で閉じる。
+- 放置したセッションは `pc stop` か `tmux -L slack-claude-bot kill-session -t scb-...` で閉じる（bot専用のtmuxソケット `slack-claude-bot` を使う。一覧は `tmux -L slack-claude-bot ls`）。
 
 ## 開発
 
