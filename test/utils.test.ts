@@ -95,12 +95,12 @@ describe('splitMessage', () => {
 describe('formatResumeCommand', () => {
   it('通常のパスはそのまま使う', () => {
     expect(formatResumeCommand('/Users/x/works/ob-ops-base', 'abc-123')).toBe(
-      'cd /Users/x/works/ob-ops-base && claude --resume abc-123'
+      'cd /Users/x/works/ob-ops-base && claude --resume abc-123 --remote-control'
     );
   });
   it('空白やクォートを含むパスはシングルクォートで囲む', () => {
     expect(formatResumeCommand("/Users/x/my repo's", 'id')).toBe(
-      "cd '/Users/x/my repo'\\''s' && claude --resume id"
+      "cd '/Users/x/my repo'\\''s' && claude --resume id --remote-control"
     );
   });
 });

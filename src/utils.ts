@@ -103,11 +103,12 @@ function detectOpenFence(text: string): string | null {
 
 /**
  * PCのターミナルで同じセッションを再開するためのコマンドを組み立てる。
+ * Remote Control付きで再開し、Claudeデスクトップアプリのサイドバーからも開けるようにする。
  * パスに空白や記号が含まれる場合はシングルクォートで囲む。
  */
 export function formatResumeCommand(repoPath: string, sessionId: string): string {
   const quoted = /^[A-Za-z0-9_./~-]+$/.test(repoPath) ? repoPath : `'${repoPath.replace(/'/g, `'\\''`)}'`;
-  return `cd ${quoted} && claude --resume ${sessionId}`;
+  return `cd ${quoted} && claude --resume ${sessionId} --remote-control`;
 }
 
 /**

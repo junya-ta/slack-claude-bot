@@ -238,7 +238,7 @@ async function handleText(job: Job): Promise<void> {
     const ctx = loadThreadContext(threadKey);
     if (ctx?.sessionId) {
       await say({
-        text: `PCで続けるには:\n\`\`\`\n${formatResumeCommand(ctx.repoPath, ctx.sessionId)}\n\`\`\``,
+        text: `PCで続けるには（Remote Control付きなのでデスクトップアプリのサイドバーからも開ける。PCで開いている間はSlackからこのスレッドに投げない）:\n\`\`\`\n${formatResumeCommand(ctx.repoPath, ctx.sessionId)}\n\`\`\``,
         thread_ts: threadKey,
       });
     } else {
@@ -421,7 +421,7 @@ async function executeJob(job: Job): Promise<void> {
 
       if (!resumeSessionId) {
         const resumeHint = savedSessionId
-          ? `\nPCで続けるには:\n\`\`\`\n${formatResumeCommand(currentRepoPath, savedSessionId)}\n\`\`\``
+          ? `\nPCで続けるには（Remote Control付きなのでデスクトップアプリのサイドバーからも開ける。PCで開いている間はSlackからこのスレッドに投げない）:\n\`\`\`\n${formatResumeCommand(currentRepoPath, savedSessionId)}\n\`\`\``
           : '';
         await say({
           text: `_スレッドに返信で継続 | repo: ${currentRepoName}_${resumeHint}`,
