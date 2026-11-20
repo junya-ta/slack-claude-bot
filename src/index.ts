@@ -22,6 +22,14 @@ import {
   type IncomingMessageEvent,
 } from './routing.js';
 import { runClaude } from './claude.js';
+import {
+  pcSessionName,
+  hasPcSession,
+  captureRemoteUrl,
+  waitForRemoteUrl,
+  startPcSession,
+  stopPcSession,
+} from './pcSession.js';
 import { logger } from './logger.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -194,7 +202,8 @@ const HELP_TEXT = [
   '• `repo:リポジトリ名 タスク` - リポジトリを明示して開始（省略時は既定リポジトリ）',
   '• `repos` / `list` - リポジトリ一覧を表示',
   '• `reset` - スレッドのセッションをリセット',
-  '• `pc` - このスレッドの会話をPCのターミナルで続けるコマンドを表示',
+  '• `pc` - このスレッドの会話をPCでRemote Control付きで起動（tmux）。起動中はSlackからは実行されません',
+  '• `pc stop` - PCで起動したセッションを閉じてSlackに戻す',
   '• `help` - このヘルプを表示',
   '• 処理中に送ったメッセージはキューに積まれ、前の処理が終わり次第順に実行されます',
   '',
@@ -215,6 +224,58 @@ interface Job {
 const threadQueues = new Map<string, Job[]>();
 let shuttingDown = false;
 
+const PC_BUSY_TEXT = 'PCで起動中です。`pc stop` で閉じてから送ってください。';
+
+const PC_NOTE = '終わったら `pc stop`。起動中はSlackからこのスレッドへの通常メッセージは実行しません。';
+
+/** `pc` / `resume`: tmux上でRemote Control付きclaudeを起動し、URLを返す。失敗時は手動コマンドにフォールバック。 */
+async function handlePc(job: Job): Promise<void> {
+  const { threadKey, say } = job;
+  const ctx = loadThreadContext(threadKey);
+  if (!ctx?.sessionId) {
+    await say({ text: 'このスレッドにはまだセッションがありません。', thread_ts: threadKey });
+    return;
+  }
+  const name = pcSessionName(threadKey);
+  const fallback = async (): Promise<void> => {
+    await say({
+      text: `PCで続けるには（手動）:\n\`\`\`\n${formatResumeCommand(ctx.repoPath, ctx.sessionId)}\n\`\`\``,
+      thread_ts: threadKey,
+    });
+  };
+
+  try {
+    if (await hasPcSession(name)) {
+      const url = await captureRemoteUrl(name);
+      await say({
+        text: `既に起動中です。${url ? `次のURLまたはデスクトップアプリのサイドバーから開けます: ${url}` : `URLを取得できませんでした。\`tmux attach -t ${name}\` で確認してください。`}\n${PC_NOTE}`,
+        thread_ts: threadKey,
+      });
+      return;
+    }
+
+    await startPcSession(name, ctx.repoPath, {
+      sessionId: ctx.sessionId,
+      skipPermissions: config.skipPermissions,
+    });
+    const url = await waitForRemoteUrl(name);
+    if (url) {
+      await say({
+        text: `PCで起動しました（Remote Control）。デスクトップアプリのサイドバー、または次のURLから開けます: ${url}\n${PC_NOTE}`,
+        thread_ts: threadKey,
+      });
+    } else {
+      await say({
+        text: `起動はしましたがURLを取得できませんでした。\`tmux attach -t ${name}\` で確認してください。\n${PC_NOTE}`,
+        thread_ts: threadKey,
+      });
+    }
+  } catch (err) {
+    logger.error(`[PcSession] Failed to start ${name}:`, err);
+    await fallback();
+  }
+}
+
 /**
  * DM・チャンネル共通のメッセージ処理。認可チェックは呼び出し側で済ませておくこと。
  */
@@ -234,20 +295,25 @@ async function handleText(job: Job): Promise<void> {
     return;
   }
 
-  if (text === 'pc' || text === 'resume') {
-    const ctx = loadThreadContext(threadKey);
-    if (ctx?.sessionId) {
-      await say({
-        text: `PCで続けるには（Remote Control付きなのでデスクトップアプリのサイドバーからも開ける。PCで開いている間はSlackからこのスレッドに投げない）:\n\`\`\`\n${formatResumeCommand(ctx.repoPath, ctx.sessionId)}\n\`\`\``,
-        thread_ts: threadKey,
-      });
+  if (text === 'pc stop' || text === 'resume stop') {
+    if (await stopPcSession(pcSessionName(threadKey))) {
+      await say({ text: 'PCのセッションを閉じました。以降はSlackから続けられます。', thread_ts: threadKey });
     } else {
-      await say({ text: 'このスレッドにはまだセッションがありません。', thread_ts: threadKey });
+      await say({ text: '起動中のPCセッションはありません。', thread_ts: threadKey });
     }
     return;
   }
 
+  if (text === 'pc' || text === 'resume') {
+    await handlePc(job);
+    return;
+  }
+
   if (text === 'reset') {
+    if (await hasPcSession(pcSessionName(threadKey))) {
+      await say({ text: PC_BUSY_TEXT, thread_ts: threadKey });
+      return;
+    }
     threadQueues.delete(threadKey);
     if (deleteThreadContext(threadKey)) {
       await say({
@@ -257,6 +323,12 @@ async function handleText(job: Job): Promise<void> {
     } else {
       await say({ text: 'このスレッドにはアクティブなセッションがありません。', thread_ts: threadKey });
     }
+    return;
+  }
+
+  // PCで起動中ならSlackからは実行しない（キューにも積まない）
+  if (await hasPcSession(pcSessionName(threadKey))) {
+    await say({ text: PC_BUSY_TEXT, thread_ts: threadKey });
     return;
   }
 
@@ -421,7 +493,7 @@ async function executeJob(job: Job): Promise<void> {
 
       if (!resumeSessionId) {
         const resumeHint = savedSessionId
-          ? `\nPCで続けるには（Remote Control付きなのでデスクトップアプリのサイドバーからも開ける。PCで開いている間はSlackからこのスレッドに投げない）:\n\`\`\`\n${formatResumeCommand(currentRepoPath, savedSessionId)}\n\`\`\``
+          ? `\nPCで続けるには \`pc\` と送る（botがRemote Control付きで起動します）。手動: \`${formatResumeCommand(currentRepoPath, savedSessionId)}\``
           : '';
         await say({
           text: `_スレッドに返信で継続 | repo: ${currentRepoName}_${resumeHint}`,
