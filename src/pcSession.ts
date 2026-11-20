@@ -68,7 +68,7 @@ export async function hasPcSession(name: string): Promise<boolean> {
 export async function captureRemoteUrl(name: string): Promise<string | null> {
   try {
     // 折り返しでURLが分断されないよう -J で行結合
-    const { stdout } = await execFileAsync('tmux', ['capture-pane', '-p', '-J', '-t', `=${name}`]);
+    const { stdout } = await execFileAsync('tmux', ['capture-pane', '-p', '-J', '-t', `=${name}:`]);
     return extractRemoteUrl(stdout);
   } catch {
     return null;
