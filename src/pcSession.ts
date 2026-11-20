@@ -141,3 +141,64 @@ export async function stopPcSession(name: string): Promise<boolean> {
     return false;
   }
 }
+
+export interface PcSessionInfo {
+  name: string;
+  threadKey: string;
+  createdAt: Date;
+  channelId?: string;
+}
+
+/** `scb-1794901909-809699` → `1794901909.809699`（pcSessionName の逆変換）。scb- 以外は null。 */
+export function threadKeyFromSessionName(name: string): string | null {
+  const m = name.match(/^scb-(\d+)-(\d+)$/);
+  return m ? `${m[1]}.${m[2]}` : null;
+}
+
+// tmuxは -F の出力中のタブ等の制御文字を _ に置き換えるので、区切りは | にする
+const LIST_FORMAT = '#{session_name}|#{session_created}|#{@scb_channel}';
+
+/** `tmux list-sessions -F LIST_FORMAT` の出力を解釈する。bot以外の名前は除外。 */
+export function parseSessionList(stdout: string): PcSessionInfo[] {
+  const result: PcSessionInfo[] = [];
+  for (const line of stdout.split('\n')) {
+    const [name, created, channelId] = line.split('|');
+    const threadKey = name ? threadKeyFromSessionName(name) : null;
+    if (!name || !threadKey) continue;
+    result.push({
+      name,
+      threadKey,
+      createdAt: new Date(Number(created) * 1000),
+      ...(channelId ? { channelId } : {}),
+    });
+  }
+  return result;
+}
+
+/** 起動中のPCセッション一覧（古い順）。tmux未インストール・サーバ未起動は空配列。 */
+export async function listPcSessions(): Promise<PcSessionInfo[]> {
+  try {
+    const { stdout } = await execFileAsync('tmux', [...T, 'list-sessions', '-F', LIST_FORMAT]);
+    return parseSessionList(stdout).sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+  } catch {
+    return [];
+  }
+}
+
+/** 起動したスレッドのチャンネルをtmuxのユーザーオプションに記録する（一覧でスレッドへのリンクを出すため）。 */
+export async function tagPcSessionChannel(name: string, channelId: string): Promise<void> {
+  try {
+    await execFileAsync('tmux', [...T, 'set-option', '-t', `=${name}:`, '@scb_channel', channelId]);
+  } catch (err) {
+    logger.warn(`[PcSession] set-option failed for ${name}:`, err);
+  }
+}
+
+/** 起動中のPCセッションをすべて閉じる。閉じた数を返す。 */
+export async function stopAllPcSessions(): Promise<number> {
+  let count = 0;
+  for (const s of await listPcSessions()) {
+    if (await stopPcSession(s.name)) count++;
+  }
+  return count;
+}

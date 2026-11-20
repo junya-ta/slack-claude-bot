@@ -6,6 +6,8 @@ import {
   buildTmuxNewSessionArgs,
   extractRemoteUrl,
   tmuxAttachCommand,
+  threadKeyFromSessionName,
+  parseSessionList,
 } from '../src/pcSession.js';
 
 describe('pcSessionName', () => {
@@ -83,5 +85,26 @@ describe('extractRemoteUrl', () => {
 describe('tmuxAttachCommand', () => {
   it('bot専用ソケットを指定する', () => {
     expect(tmuxAttachCommand('scb-1-2')).toBe('tmux -L slack-claude-bot attach -t scb-1-2');
+  });
+});
+
+describe('threadKeyFromSessionName', () => {
+  it('pcSessionName の逆変換', () => {
+    expect(threadKeyFromSessionName('scb-1794901909-809699')).toBe('1794901909.809699');
+    expect(threadKeyFromSessionName(pcSessionName('1700000000.123456'))).toBe('1700000000.123456');
+  });
+  it('bot以外の名前は null', () => {
+    expect(threadKeyFromSessionName('rcprobe')).toBeNull();
+    expect(threadKeyFromSessionName('scb-selftest')).toBeNull();
+  });
+});
+
+describe('parseSessionList', () => {
+  it('名前・作成時刻・チャンネルを読み、bot以外を除外する', () => {
+    const out = 'scb-1-2|1700000000|D123\nother|1700000001|\nscb-3-4|1700000002|\n';
+    expect(parseSessionList(out)).toEqual([
+      { name: 'scb-1-2', threadKey: '1.2', createdAt: new Date(1700000000 * 1000), channelId: 'D123' },
+      { name: 'scb-3-4', threadKey: '3.4', createdAt: new Date(1700000002 * 1000) },
+    ]);
   });
 });

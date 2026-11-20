@@ -30,6 +30,9 @@ import {
   startPcSession,
   stopPcSession,
   tmuxAttachCommand,
+  listPcSessions,
+  stopAllPcSessions,
+  tagPcSessionChannel,
 } from './pcSession.js';
 import { logger } from './logger.js';
 
@@ -197,18 +200,25 @@ function createLiveStatus(client: App['client'], channelId: string, ts: string |
 }
 
 const HELP_TEXT = [
-  '*使い方（DM）:*',
-  '• botとのDMに普通にメッセージを送る（メンション不要）→ 新しい会話を開始して実行',
-  '• そのメッセージのスレッドに返信 → 同じセッションで継続',
-  '• `repo:リポジトリ名 タスク` - リポジトリを明示して開始（省略時は既定リポジトリ）',
-  '• `repos` / `list` - リポジトリ一覧を表示',
-  '• `reset` - スレッドのセッションをリセット',
-  '• `pc` - このスレッドの会話をPCでRemote Control付きで起動（tmux）。起動中はSlackからは実行されません',
-  '• `pc stop` - PCで起動したセッションを閉じてSlackに戻す',
-  '• `help` - このヘルプを表示',
-  '• 処理中に送ったメッセージはキューに積まれ、前の処理が終わり次第順に実行されます',
+  '*コマンド一覧*',
   '',
-  '*チャンネルで使う場合:* `@bot メッセージ` のようにメンションします（`repo:` 指定は同様）。',
+  '*会話*',
+  '• （普通のメッセージ） - 新しい会話を開始。そのスレッドに返信すると同じ会話を継続（DMはメンション不要）',
+  '• `repo:名前 タスク` - リポジトリを指定して開始（省略時は既定リポジトリ）',
+  '• `reset` - このスレッドの会話をリセット（スレッド内）',
+  '',
+  '*PCで続ける*',
+  '• `pc` - このスレッドの会話をPCでRemote Control付きで起動し、URLを返す（スレッド内）',
+  '• `pc stop` - このスレッドのPCセッションを閉じてSlackに戻す（スレッド内）',
+  '• `pc list` - 起動中のPCセッションを一覧（どこからでも）',
+  '• `pc stop all` - 起動中のPCセッションをすべて閉じる（どこからでも）',
+  '',
+  '*その他*',
+  '• `repos` - 登録済みリポジトリ一覧',
+  '• `help` - このコマンド一覧',
+  '',
+  '_実行中に送ったメッセージはキューに積まれ、順に実行されます。PCで起動中のスレッドではSlackからは実行しません。_',
+  '_チャンネルでは `@bot メッセージ` のようにメンションして使います。_',
 ].join('\n');
 
 type SayFn = (msg: { text: string; thread_ts?: string }) => Promise<{ ts?: string }>;
@@ -259,6 +269,7 @@ async function handlePc(job: Job): Promise<void> {
       sessionId: ctx.sessionId,
       skipPermissions: config.skipPermissions,
     });
+    await tagPcSessionChannel(name, job.channelId);
     const url = await waitForRemoteUrl(name);
     if (url) {
       await say({
@@ -281,7 +292,7 @@ async function handlePc(job: Job): Promise<void> {
  * DM・チャンネル共通のメッセージ処理。認可チェックは呼び出し側で済ませておくこと。
  */
 async function handleText(job: Job): Promise<void> {
-  const { text, threadKey, say } = job;
+  const { text, threadKey, say, client } = job;
 
   if (text === 'repos' || text === 'list') {
     const repoList = Object.entries(config.repos)
@@ -291,8 +302,45 @@ async function handleText(job: Job): Promise<void> {
     return;
   }
 
-  if (text === 'help') {
+  if (['help', '?', 'ヘルプ', 'コマンド'].includes(text.toLowerCase())) {
     await say({ text: HELP_TEXT, thread_ts: threadKey });
+    return;
+  }
+
+  if (text === 'pc list' || text === 'pc ls') {
+    const sessions = await listPcSessions();
+    if (sessions.length === 0) {
+      await say({ text: '起動中のPCセッションはありません。', thread_ts: threadKey });
+      return;
+    }
+    const lines = await Promise.all(
+      sessions.map(async (s) => {
+        const started = s.createdAt.toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo', hour12: false });
+        const repo = loadThreadContext(s.threadKey)?.repoName ?? '?';
+        let link = '';
+        if (s.channelId) {
+          const res = await client.chat
+            .getPermalink({ channel: s.channelId, message_ts: s.threadKey })
+            .catch(() => undefined);
+          if (res?.permalink) link = ` <${res.permalink}|スレッド>`;
+        }
+        const url = await captureRemoteUrl(s.name);
+        return `• \`${s.name}\` repo:${repo} 起動:${started}${link}${url ? ` <${url}|開く>` : ''}`;
+      })
+    );
+    await say({
+      text: `*起動中のPCセッション（${sessions.length}件）*\n${lines.join('\n')}\n_閉じるにはスレッドで \`pc stop\`、まとめて閉じるには \`pc stop all\`_`,
+      thread_ts: threadKey,
+    });
+    return;
+  }
+
+  if (text === 'pc stop all') {
+    const n = await stopAllPcSessions();
+    await say({
+      text: n > 0 ? `PCセッションを${n}件閉じました。` : '起動中のPCセッションはありません。',
+      thread_ts: threadKey,
+    });
     return;
   }
 
